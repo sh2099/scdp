@@ -110,17 +110,41 @@ def create_gto_basis(atom_types: torch.Tensor, atom_coords: torch.Tensor,
 def compute_overlap_integrals_scdp(molecule, gto_dict: Dict[str, GTOs], 
                                   atom_coords: torch.Tensor, atom_types: torch.Tensor,
                                   max_probes_per_chunk: int = 50000,
-                                  devices: Optional[List[str]] = None) -> torch.Tensor:
+                                  devices: Optional[List[str]] = None,
+                                  exclude_gpus: Optional[List[int]] = None) -> torch.Tensor:
     """
     Compute overlap integrals using scdp's GTO.compute() in a vectorized way
     with probe blocking. Now supports parallel processing across devices.
+    
+    Args:
+        molecule: Molecule object with probe_coords and chg_labels
+        gto_dict: Dictionary of GTO objects
+        atom_coords: Coordinates of basis centers
+        atom_types: Types of basis centers
+        max_probes_per_chunk: Maximum probes per chunk
+        devices: List of device strings to use (if None, auto-detect)
+        exclude_gpus: List of GPU indices to exclude from auto-detection
+    
+    Returns:
+        Overlap integrals tensor
     """
     print("Computing overlap integrals using scdp methods with probe blocking...")
 
     # Determine devices
     if devices is None:
         if torch.cuda.is_available():
-            devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+            all_gpus = list(range(torch.cuda.device_count()))
+            if exclude_gpus is not None:
+                available_gpus = [i for i in all_gpus if i not in exclude_gpus]
+                if not available_gpus:
+                    print("Warning: All GPUs excluded, falling back to CPU")
+                    devices = ["cpu"]
+                else:
+                    devices = [f"cuda:{i}" for i in available_gpus]
+                    if exclude_gpus:
+                        print(f"Excluded GPUs: {exclude_gpus}")
+            else:
+                devices = [f"cuda:{i}" for i in all_gpus]
         else:
             devices = ["cpu"]
     print(f"Using devices: {devices}")
@@ -229,17 +253,41 @@ def compute_overlap_integrals_scdp(molecule, gto_dict: Dict[str, GTOs],
 def compute_overlap_matrix_scdp(gto_dict: Dict[str, GTOs], 
                                atom_coords: torch.Tensor, atom_types: torch.Tensor,
                                molecule, max_probes_per_chunk: int = 50000,
-                               devices: Optional[List[str]] = None) -> torch.Tensor:
+                               devices: Optional[List[str]] = None,
+                               exclude_gpus: Optional[List[int]] = None) -> torch.Tensor:
     """
     Compute overlap matrix using vectorized per-type calls to GTO.compute()
     and probe blocking. Parallel across devices.
+    
+    Args:
+        gto_dict: Dictionary of GTO objects
+        atom_coords: Coordinates of basis centers
+        atom_types: Types of basis centers
+        molecule: Molecule object for volume element calculation
+        max_probes_per_chunk: Maximum probes per chunk
+        devices: List of device strings to use (if None, auto-detect)
+        exclude_gpus: List of GPU indices to exclude from auto-detection
+    
+    Returns:
+        Overlap matrix tensor
     """
     print("Computing overlap matrix using scdp methods with probe blocking...")
 
     # determine devices
     if devices is None:
         if torch.cuda.is_available():
-            devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+            all_gpus = list(range(torch.cuda.device_count()))
+            if exclude_gpus is not None:
+                available_gpus = [i for i in all_gpus if i not in exclude_gpus]
+                if not available_gpus:
+                    print("Warning: All GPUs excluded, falling back to CPU")
+                    devices = ["cpu"]
+                else:
+                    devices = [f"cuda:{i}" for i in available_gpus]
+                    if exclude_gpus:
+                        print(f"Excluded GPUs: {exclude_gpus}")
+            else:
+                devices = [f"cuda:{i}" for i in all_gpus]
         else:
             devices = ["cpu"]
     print(f"Using devices: {devices}")
@@ -337,15 +385,40 @@ def compute_overlap_matrix_scdp(gto_dict: Dict[str, GTOs],
 def reconstruct_density_scdp(coefficients: torch.Tensor, gto_dict: Dict[str, GTOs],
                             atom_coords: torch.Tensor, atom_types: torch.Tensor,
                             molecule, max_probes_per_chunk: int = 50000,
-                            devices: Optional[List[str]] = None) -> torch.Tensor:
+                            devices: Optional[List[str]] = None,
+                            exclude_gpus: Optional[List[int]] = None) -> torch.Tensor:
     """
     Reconstruct charge density using scdp methods with probe blocking and multi-GPU.
+    
+    Args:
+        coefficients: Basis function coefficients
+        gto_dict: Dictionary of GTO objects
+        atom_coords: Coordinates of basis centers
+        atom_types: Types of basis centers
+        molecule: Molecule object
+        max_probes_per_chunk: Maximum probes per chunk
+        devices: List of device strings to use (if None, auto-detect)
+        exclude_gpus: List of GPU indices to exclude from auto-detection
+    
+    Returns:
+        Reconstructed charge density
     """
     print("Reconstructing charge density using scdp methods with probe blocking...")
 
     if devices is None:
         if torch.cuda.is_available():
-            devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+            all_gpus = list(range(torch.cuda.device_count()))
+            if exclude_gpus is not None:
+                available_gpus = [i for i in all_gpus if i not in exclude_gpus]
+                if not available_gpus:
+                    print("Warning: All GPUs excluded, falling back to CPU")
+                    devices = ["cpu"]
+                else:
+                    devices = [f"cuda:{i}" for i in available_gpus]
+                    if exclude_gpus:
+                        print(f"Excluded GPUs: {exclude_gpus}")
+            else:
+                devices = [f"cuda:{i}" for i in all_gpus]
         else:
             devices = ["cpu"]
     print(f"Using devices: {devices}")
