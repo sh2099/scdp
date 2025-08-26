@@ -21,7 +21,8 @@ def analyze_molecule_charge_reconstruction(
     override_atom_type: Optional[int] = None,
     vnode_elem: int = 1,
     max_probes_per_chunk: int = 50000,
-    device: str = 'cpu'
+    device: str = 'cpu',
+    devices: Optional[List[str]] = None
 ) -> Dict:
     """
     Analyze charge density reconstruction for a single molecule using scdp methods.
@@ -41,6 +42,9 @@ def analyze_molecule_charge_reconstruction(
     Returns:
         Dictionary with analysis results
     """
+    # Start total timing
+    total_start_time = time.time()
+    
     print(f"\n{'='*80}")
     print(f"CHARGE DENSITY RECONSTRUCTION ANALYSIS")
     print(f"Molecule: {molecule_idx}")
@@ -73,6 +77,14 @@ def analyze_molecule_charge_reconstruction(
     atom_coords = atom_coords.to(device)
     atom_types = atom_types.to(device)
     
+    # Determine devices for parallel compute
+    if devices is None:
+        if torch.cuda.is_available():
+            devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+        else:
+            devices = ["cpu"]
+    print(f"Detected devices for processing: {devices}")
+
     # Step 3: Construct GTO basis
     print("\n3. Constructing GTO basis...")
     gto_dict = create_gto_basis(
@@ -93,24 +105,24 @@ def analyze_molecule_charge_reconstruction(
             total_basis_funcs += n_atoms_of_type * gto_dict[t_str].outdim
     print(f"Total basis functions: {total_basis_funcs}")
     
-    # Step 4: Compute overlap integrals with probe blocking
+    # Step 4: Compute overlap integrals with probe blocking and multi-GPU
     print("\n4. Computing overlap integrals...")
     start_time = time.time()
     overlap_integrals = compute_overlap_integrals_scdp(
-        molecule, gto_dict, atom_coords, atom_types, max_probes_per_chunk
+        molecule, gto_dict, atom_coords, atom_types, max_probes_per_chunk, devices=devices
     )
     overlap_time = time.time() - start_time
     print(f"Overlap computation time: {overlap_time:.2f}s")
-    
-    # Step 5: Compute overlap matrix with probe blocking
+ 
+    # Step 5: Compute overlap matrix with probe blocking and multi-GPU
     print("\n5. Computing overlap matrix...")
     start_time = time.time()
     overlap_matrix = compute_overlap_matrix_scdp(
-        gto_dict, atom_coords, atom_types, molecule, max_probes_per_chunk
+        gto_dict, atom_coords, atom_types, molecule, max_probes_per_chunk, devices=devices
     )
     matrix_time = time.time() - start_time
     print(f"Matrix computation time: {matrix_time:.2f}s")
-    
+
     # Step 6: Test different regularization values
     print("\n6. Testing regularization values...")
     results = {}
@@ -123,12 +135,12 @@ def analyze_molecule_charge_reconstruction(
             W_reg = overlap_matrix + reg * torch.eye(total_basis_funcs, dtype=torch.float64, device=device)
             coefficients = torch.linalg.solve(W_reg, overlap_integrals.to(device))
             
-            # Reconstruct charge density with probe blocking
+            # Reconstruct charge density (multi-GPU)
             print("    Reconstructing charge density...")
             start_time = time.time()
             reconstructed = reconstruct_density_scdp(
-                coefficients.cpu(), gto_dict, atom_coords.cpu(), atom_types.cpu(), 
-                molecule.cpu(), max_probes_per_chunk
+                coefficients.cpu(), gto_dict, atom_coords.cpu(), atom_types.cpu(),
+                molecule.cpu(), max_probes_per_chunk, devices=devices
             )
             recon_time = time.time() - start_time
             print(f"    Reconstruction time: {recon_time:.2f}s")
@@ -173,6 +185,9 @@ def analyze_molecule_charge_reconstruction(
                 'error': str(e)
             }
     
+    # Calculate total time
+    total_time = time.time() - total_start_time
+    
     # Summary
     print(f"\n{'='*60}")
     print("ANALYSIS SUMMARY")
@@ -182,6 +197,7 @@ def analyze_molecule_charge_reconstruction(
     print(f"Probe points: {len(molecule.chg_labels)}")
     print(f"Probe chunks used: {len(probe_chunks) if 'probe_chunks' in locals() else 'N/A'}")
     print(f"Center info: {center_info}")
+    print(f"Total molecule computation time: {total_time:.2f}s")
     
     successful_results = {k: v for k, v in results.items() if v['success']}
     if successful_results:
@@ -205,7 +221,8 @@ def analyze_molecule_charge_reconstruction(
         'results': results,
         'timings': {
             'overlap_time': overlap_time,
-            'matrix_time': matrix_time
+            'matrix_time': matrix_time,
+            'total_time': total_time
         },
         'probe_blocking': {
             'max_probes_per_chunk': max_probes_per_chunk,
@@ -219,12 +236,12 @@ def main():
     # Test configurations
     test_configs = [
         {
-            'molecule_idx': 3475,
+            'molecule_idx': 34075,
             'regularizations': [1e-10],
-            'basis_set_name': 'def2-svp',
+            'basis_set_name': 'def2-QZVPP',
             'use_augmentation': True,
             'use_vnodes': True,
-            'override_atom_type': 6,
+            'override_atom_type': 8,
             'max_probes_per_chunk': 50000  # Smaller chunks for testing
         },
     ]

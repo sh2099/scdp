@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from copy import deepcopy
+import concurrent.futures
 
 from scdp.model.basis_set import get_basis_set, transform_basis_set, aug_etb_for_basis
 from scdp.model.gtos import GTOs
@@ -108,14 +109,22 @@ def create_gto_basis(atom_types: torch.Tensor, atom_coords: torch.Tensor,
 
 def compute_overlap_integrals_scdp(molecule, gto_dict: Dict[str, GTOs], 
                                   atom_coords: torch.Tensor, atom_types: torch.Tensor,
-                                  max_probes_per_chunk: int = 50000) -> torch.Tensor:
+                                  max_probes_per_chunk: int = 50000,
+                                  devices: Optional[List[str]] = None) -> torch.Tensor:
     """
     Compute overlap integrals using scdp's GTO.compute() in a vectorized way
-    with probe blocking. Uses per-atom ordering: for each atom of a given
-    element we append its outdim orbitals in sequence.
+    with probe blocking. Now supports parallel processing across devices.
     """
     print("Computing overlap integrals using scdp methods with probe blocking...")
-    
+
+    # Determine devices
+    if devices is None:
+        if torch.cuda.is_available():
+            devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+        else:
+            devices = ["cpu"]
+    print(f"Using devices: {devices}")
+
     # Get total number of probes
     n_probes = len(molecule.probe_coords)
     
@@ -128,81 +137,113 @@ def compute_overlap_integrals_scdp(molecule, gto_dict: Dict[str, GTOs],
         cell_volume = torch.det(molecule.cell[0]).abs().double()
         volume_element = cell_volume / n_probes
     
-    print(f"Volume element: {volume_element:.6f}")
-    print(f"Total probes: {n_probes}")
-    print(f"Max probes per chunk: {max_probes_per_chunk}")
-    
     atom_coords = atom_coords.double()
     unique_types = torch.unique(atom_types)
-    
-    # Correct total basis functions: sum over atoms (not unique types)
+
+    # correct total basis functions (per-atom)
     total_basis_funcs = 0
+    per_type_info = []
     for atom_type in unique_types:
         type_str = str(atom_type.item())
         if type_str in gto_dict:
             n_atoms_of_type = int((atom_types == atom_type).sum().item())
-            total_basis_funcs += n_atoms_of_type * gto_dict[type_str].outdim
+            outdim = gto_dict[type_str].outdim
+            per_type_info.append((atom_type, type_str, n_atoms_of_type, outdim))
+            total_basis_funcs += n_atoms_of_type * outdim
 
-    overlaps = torch.zeros(total_basis_funcs, dtype=torch.float64)
-    print(f"Total basis functions: {total_basis_funcs}")
-    
+    overlaps_cpu = torch.zeros(total_basis_funcs, dtype=torch.float64)
+
     probe_chunks = get_probe_chunks(n_probes, max_probes_per_chunk)
-    print(f"Processing {len(probe_chunks)} probe chunks...")
-    
-    for chunk_idx, probe_indices in enumerate(probe_chunks):
-        print(f"  Processing chunk {chunk_idx + 1}/{len(probe_chunks)}: {len(probe_indices)} probes")
-        mol_chunk = get_molecule_probe_chunk(molecule, probe_indices)
-        probe_coords = mol_chunk.probe_coords.double()          # (n_probes_chunk, 3)
-        charge_density = mol_chunk.chg_labels.double()         # (n_probes_chunk,)
-        n_probes_chunk = len(probe_coords)
-        
-        basis_offset = 0
-        for atom_type in unique_types:
-            type_str = str(atom_type.item())
-            if type_str not in gto_dict:
+    print(f"Total probes: {n_probes}, chunks: {len(probe_chunks)}, total basis funcs: {total_basis_funcs}")
+
+    # distribute chunks across devices (round-robin)
+    n_devices = len(devices)
+    work_per_device: List[List[torch.Tensor]] = [[] for _ in range(n_devices)]
+    for i, chunk in enumerate(probe_chunks):
+        work_per_device[i % n_devices].append(chunk)
+
+    def _worker(device_str: str, chunks: List[torch.Tensor]) -> torch.Tensor:
+        dev = torch.device(device_str)
+        use_cuda = (dev.type == "cuda")
+        if use_cuda:
+            torch.cuda.set_device(dev)
+        #print(f"[{device_str}] Worker starting with {len(chunks)} chunks")
+
+        # create device-local copies
+        gto_dev = {k: deepcopy(v).to(dev) for k, v in gto_dict.items()}
+        atom_coords_dev = atom_coords.to(dev)
+
+        local_accum = torch.zeros(total_basis_funcs, dtype=torch.float64, device=dev)
+
+        for cidx, probe_indices in enumerate(chunks):
+            print(f"[{device_str}] processing chunk {cidx+1}/{len(chunks)} ({len(probe_indices)} probes)")
+            mol_chunk = get_molecule_probe_chunk(molecule, probe_indices)
+            probe_coords = mol_chunk.probe_coords.double().to(dev)
+            charge_density = mol_chunk.chg_labels.double().to(dev)
+            n_probes_chunk = len(probe_coords)
+
+            basis_offset = 0
+            for (atom_type, type_str, n_atoms_type, outdim) in per_type_info:
+                if type_str not in gto_dev:
+                    continue
+                gto = gto_dev[type_str]
+                type_mask = (atom_types == atom_type)
+                type_coords = atom_coords_dev[type_mask]
+                if len(type_coords) == 0:
+                    continue
+
+                # vectorized evaluation for all probe-atom pairs in this type
+                vecs = (probe_coords.unsqueeze(1) - type_coords.unsqueeze(0)).reshape(-1, 3)
+                vecs = vecs[..., [1,2,0]] / 0.52917721067
+                orbital_pairs = gto.compute(vecs)  # (n_pairs, outdim)
+                orbital_values = orbital_pairs.view(n_probes_chunk, len(type_coords), outdim)
+
+                contrib = (charge_density.view(-1,1,1) * orbital_values).sum(dim=0) * volume_element
+
+                # accumulate into local_accum
+                for atom_idx in range(len(type_coords)):
+                    start = basis_offset + atom_idx * outdim
+                    end = start + outdim
+                    local_accum[start:end] += contrib[atom_idx].to(local_accum.dtype)
+
+                basis_offset += len(type_coords) * outdim
+
+        print(f"[{device_str}] Worker finished")
+        return local_accum.cpu()
+
+    # run workers
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_devices) as ex:
+        futures = []
+        for i, chunks in enumerate(work_per_device):
+            if len(chunks) == 0:
                 continue
-            gto = gto_dict[type_str]
-            type_mask = (atom_types == atom_type)
-            type_coords = atom_coords[type_mask]                # (n_atoms_type, 3)
-            n_atoms_type = len(type_coords)
-            if n_atoms_type == 0:
-                continue
-            
-            # Vectorized per-type evaluation:
-            # build vecs: (n_probes_chunk, n_atoms_type, 3) -> flatten to (n_pairs,3)
-            vecs = (probe_coords.unsqueeze(1) - type_coords.unsqueeze(0)).reshape(-1, 3)
-            # reorder and convert to bohr
-            vecs = vecs[..., [1,2,0]] / 0.52917721067
-            # compute orbital values for all pairs: (n_pairs, outdim)
-            orbital_pairs = gto.compute(vecs)  # (n_probes_chunk * n_atoms_type, outdim)
-            # reshape to (n_probes_chunk, n_atoms_type, outdim)
-            orbital_values = orbital_pairs.view(n_probes_chunk, n_atoms_type, gto.outdim)
-            
-            # integrate: sum over probes of rho * phi  -> (n_atoms_type, outdim)
-            contrib = (charge_density.view(-1,1,1) * orbital_values).sum(dim=0) * volume_element
-            
-            # place per-atom contributions into overlaps vector
-            for atom_idx in range(n_atoms_type):
-                start = basis_offset + atom_idx * gto.outdim
-                end = start + gto.outdim
-                overlaps[start:end] += contrib[atom_idx]
-            
-            basis_offset += n_atoms_type * gto.outdim
-    
-    print(f"Computed {len(overlaps)} overlap integrals")
-    print(f"Sum of overlaps: {overlaps.sum():.6f}")
+            futures.append(ex.submit(_worker, devices[i], chunks))
+        for fut in concurrent.futures.as_completed(futures):
+            overlaps_cpu += fut.result()
+
+    print(f"Computed {len(overlaps_cpu)} overlap integrals")
+    print(f"Sum of overlaps: {overlaps_cpu.sum():.6f}")
     print(f"Total electrons: {molecule.chg_labels.sum():.6f}")
-    return overlaps
+    return overlaps_cpu
 
 def compute_overlap_matrix_scdp(gto_dict: Dict[str, GTOs], 
                                atom_coords: torch.Tensor, atom_types: torch.Tensor,
-                               molecule, max_probes_per_chunk: int = 50000) -> torch.Tensor:
+                               molecule, max_probes_per_chunk: int = 50000,
+                               devices: Optional[List[str]] = None) -> torch.Tensor:
     """
     Compute overlap matrix using vectorized per-type calls to GTO.compute()
-    and probe blocking. Basis ordering matches compute_overlap_integrals_scdp.
+    and probe blocking. Parallel across devices.
     """
     print("Computing overlap matrix using scdp methods with probe blocking...")
-    
+
+    # determine devices
+    if devices is None:
+        if torch.cuda.is_available():
+            devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+        else:
+            devices = ["cpu"]
+    print(f"Using devices: {devices}")
+
     n_probes = len(molecule.probe_coords)
     if hasattr(molecule, 'grid_size'):
         grid_size = molecule.grid_size[0].double()
@@ -211,141 +252,182 @@ def compute_overlap_matrix_scdp(gto_dict: Dict[str, GTOs],
     else:
         cell_volume = torch.det(molecule.cell[0]).abs().double()
         volume_element = cell_volume / n_probes
-    
+
     atom_coords = atom_coords.double()
     unique_types = torch.unique(atom_types)
-    
-    # Correct total basis functions
+
+    # total basis funcs (per-atom)
     total_basis_funcs = 0
+    per_type_info = []
     for atom_type in unique_types:
         type_str = str(atom_type.item())
         if type_str in gto_dict:
             n_atoms_of_type = int((atom_types == atom_type).sum().item())
-            total_basis_funcs += n_atoms_of_type * gto_dict[type_str].outdim
+            outdim = gto_dict[type_str].outdim
+            per_type_info.append((atom_type, type_str, n_atoms_of_type, outdim))
+            total_basis_funcs += n_atoms_of_type * outdim
 
-    overlap_matrix = torch.zeros(total_basis_funcs, total_basis_funcs, dtype=torch.float64)
-    print(f"Computing {total_basis_funcs}x{total_basis_funcs} overlap matrix")
-    print(f"Total probes: {n_probes}")
-    print(f"Max probes per chunk: {max_probes_per_chunk}")
-    
+    overlap_matrix_cpu = torch.zeros(total_basis_funcs, total_basis_funcs, dtype=torch.float64)
+
     probe_chunks = get_probe_chunks(n_probes, max_probes_per_chunk)
-    print(f"Processing {len(probe_chunks)} probe chunks...")
-    
-    for chunk_idx, probe_indices in enumerate(probe_chunks):
-        print(f"  Processing chunk {chunk_idx + 1}/{len(probe_chunks)}: {len(probe_indices)} probes")
-        mol_chunk = get_molecule_probe_chunk(molecule, probe_indices)
-        probe_coords = mol_chunk.probe_coords.double()
-        n_probes_chunk = len(probe_coords)
-        
-        all_basis_values = torch.zeros(total_basis_funcs, n_probes_chunk, dtype=torch.float64)
-        basis_offset = 0
-        
-        for atom_type in unique_types:
-            type_str = str(atom_type.item())
-            if type_str not in gto_dict:
+    n_devices = len(devices)
+    work_per_device: List[List[torch.Tensor]] = [[] for _ in range(n_devices)]
+    for i, chunk in enumerate(probe_chunks):
+        work_per_device[i % n_devices].append(chunk)
+
+    def _worker_mat(device_str: str, chunks: List[torch.Tensor]) -> torch.Tensor:
+        dev = torch.device(device_str)
+        use_cuda = (dev.type == "cuda")
+        if use_cuda:
+            torch.cuda.set_device(dev)
+        #print(f"[{device_str}] Matrix worker starting with {len(chunks)} chunks")
+
+        gto_dev = {k: deepcopy(v).to(dev) for k, v in gto_dict.items()}
+        atom_coords_dev = atom_coords.to(dev)
+        local_mat = torch.zeros(total_basis_funcs, total_basis_funcs, dtype=torch.float64, device=dev)
+
+        for cidx, probe_indices in enumerate(chunks):
+            print(f"[{device_str}] matrix chunk {cidx+1}/{len(chunks)} ({len(probe_indices)} probes)")
+            mol_chunk = get_molecule_probe_chunk(molecule, probe_indices)
+            probe_coords = mol_chunk.probe_coords.double().to(dev)
+            n_probes_chunk = len(probe_coords)
+
+            all_vals = torch.zeros(total_basis_funcs, n_probes_chunk, dtype=torch.float64, device=dev)
+            basis_offset = 0
+            for (atom_type, type_str, n_atoms_type, outdim) in per_type_info:
+                if type_str not in gto_dev:
+                    continue
+                gto = gto_dev[type_str]
+                type_mask = (atom_types == atom_type)
+                type_coords = atom_coords_dev[type_mask]
+                if len(type_coords) == 0:
+                    continue
+
+                vecs = (probe_coords.unsqueeze(1) - type_coords.unsqueeze(0)).reshape(-1, 3)
+                vecs = vecs[..., [1,2,0]] / 0.52917721067
+                orbital_pairs = gto.compute(vecs)
+                orbital_values = orbital_pairs.view(n_probes_chunk, len(type_coords), outdim)
+
+                for atom_idx in range(len(type_coords)):
+                    start = basis_offset + atom_idx * outdim
+                    end = start + outdim
+                    all_vals[start:end] = orbital_values[:, atom_idx, :].T
+
+                basis_offset += len(type_coords) * outdim
+
+            chunk_overlap = torch.matmul(all_vals, all_vals.T) * volume_element
+            local_mat += chunk_overlap
+
+        print(f"[{device_str}] Matrix worker finished")
+        return local_mat.cpu()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_devices) as ex:
+        futures = []
+        for i, chunks in enumerate(work_per_device):
+            if len(chunks) == 0:
                 continue
-            gto = gto_dict[type_str]
-            type_mask = (atom_types == atom_type)
-            type_coords = atom_coords[type_mask]
-            n_atoms_type = len(type_coords)
-            if n_atoms_type == 0:
-                continue
-            
-            # Vectorized per-type evaluation
-            vecs = (probe_coords.unsqueeze(1) - type_coords.unsqueeze(0)).reshape(-1, 3)
-            vecs = vecs[..., [1,2,0]] / 0.52917721067
-            orbital_pairs = gto.compute(vecs)  # (n_pairs, outdim)
-            orbital_values = orbital_pairs.view(n_probes_chunk, n_atoms_type, gto.outdim)
-            
-            for atom_idx in range(n_atoms_type):
-                atom_basis_start = basis_offset + atom_idx * gto.outdim
-                atom_basis_end = atom_basis_start + gto.outdim
-                if atom_basis_end > total_basis_funcs:
-                    raise IndexError(f"Basis index {atom_basis_end-1} out of bounds for size {total_basis_funcs}")
-                all_basis_values[atom_basis_start:atom_basis_end] = orbital_values[:, atom_idx, :].T
-            
-            basis_offset += n_atoms_type * gto.outdim
-        
-        chunk_overlap = torch.matmul(all_basis_values, all_basis_values.T) * volume_element
-        overlap_matrix += chunk_overlap
-    
-    overlap_matrix = (overlap_matrix + overlap_matrix.T) / 2.0
-    print(f"Overlap matrix computed. Symmetry error: {torch.max(torch.abs(overlap_matrix - overlap_matrix.T)):.2e}")
-    return overlap_matrix
+            futures.append(ex.submit(_worker_mat, devices[i], chunks))
+        for fut in concurrent.futures.as_completed(futures):
+            overlap_matrix_cpu += fut.result()
+
+    overlap_matrix_cpu = (overlap_matrix_cpu + overlap_matrix_cpu.T) / 2.0
+    print(f"Overlap matrix computed. Symmetry error: {torch.max(torch.abs(overlap_matrix_cpu - overlap_matrix_cpu.T)):.2e}")
+    return overlap_matrix_cpu
 
 def reconstruct_density_scdp(coefficients: torch.Tensor, gto_dict: Dict[str, GTOs],
                             atom_coords: torch.Tensor, atom_types: torch.Tensor,
-                            molecule, max_probes_per_chunk: int = 50000) -> torch.Tensor:
+                            molecule, max_probes_per_chunk: int = 50000,
+                            devices: Optional[List[str]] = None) -> torch.Tensor:
     """
-    Reconstruction remains efficient by using GTO.forward with coeffs per-type.
-    Ordering of coefficients must match per-atom ordering used above.
+    Reconstruct charge density using scdp methods with probe blocking and multi-GPU.
     """
     print("Reconstructing charge density using scdp methods with probe blocking...")
-    
+
+    if devices is None:
+        if torch.cuda.is_available():
+            devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+        else:
+            devices = ["cpu"]
+    print(f"Using devices: {devices}")
+
     n_probes = len(molecule.probe_coords)
     reconstructed = torch.zeros(n_probes, dtype=torch.float64)
-    
+
     atom_coords = atom_coords.double()
     unique_types = torch.unique(atom_types)
-    
-    print(f"Total probes: {n_probes}")
-    print(f"Max probes per chunk: {max_probes_per_chunk}")
-    
-    # Get probe chunks
+
     probe_chunks = get_probe_chunks(n_probes, max_probes_per_chunk)
-    print(f"Processing {len(probe_chunks)} probe chunks...")
-    
-    # Process each probe chunk
-    for chunk_idx, probe_indices in enumerate(probe_chunks):
-        print(f"  Processing chunk {chunk_idx + 1}/{len(probe_chunks)}: {len(probe_indices)} probes")
-        
-        # Get molecule chunk
-        mol_chunk = get_molecule_probe_chunk(molecule, probe_indices)
-        probe_coords = mol_chunk.probe_coords.double()
-        n_probes_chunk = len(probe_coords)
-        
-        chunk_reconstructed = torch.zeros(n_probes_chunk, dtype=torch.float64)
-        
-        # Reconstruct for each atom type
-        basis_offset = 0
-        for atom_type in unique_types:
-            type_str = str(atom_type.item())
-            if type_str not in gto_dict:
+    n_devices = len(devices)
+    work_per_device = [[] for _ in range(n_devices)]
+    for i, chunk in enumerate(probe_chunks):
+        work_per_device[i % n_devices].append(chunk)
+
+    def _worker_recon(device_str: str, chunks: List[torch.Tensor]):
+        dev = torch.device(device_str)
+        use_cuda = (dev.type == "cuda")
+        if use_cuda:
+            torch.cuda.set_device(dev)
+        #print(f"[{device_str}] Recon worker starting with {len(chunks)} chunks")
+
+        gto_dev = {k: deepcopy(v).to(dev) for k, v in gto_dict.items()}
+        atom_coords_dev = atom_coords.to(dev)
+        coeff_dev = coefficients.to(dev)
+
+        results = []  # list of tuples (probe_indices_cpu, dens_cpu)
+        for cidx, probe_indices in enumerate(chunks):
+            print(f"[{device_str}] recon chunk {cidx+1}/{len(chunks)} ({len(probe_indices)} probes)")
+            mol_chunk = get_molecule_probe_chunk(molecule, probe_indices)
+            probe_coords = mol_chunk.probe_coords.double().to(dev)
+            n_probes_chunk = len(probe_coords)
+            chunk_reconstructed = torch.zeros(n_probes_chunk, dtype=torch.float64, device=dev)
+
+            basis_offset = 0
+            for atom_type in unique_types:
+                type_str = str(atom_type.item())
+                if type_str not in gto_dev:
+                    continue
+                gto = gto_dev[type_str]
+                type_mask = (atom_types == atom_type)
+                type_coords = atom_coords_dev[type_mask]
+                n_atoms_type = len(type_coords)
+                if n_atoms_type == 0:
+                    continue
+
+                type_coeffs = coeff_dev[basis_offset:basis_offset + n_atoms_type * gto.outdim]
+                type_coeffs = type_coeffs.view(n_atoms_type, gto.outdim)
+
+                n_probes_tensor = torch.tensor([n_probes_chunk], device=dev)
+                n_atoms_tensor = torch.tensor([n_atoms_type], device=dev)
+
+                type_contribution = gto.forward(
+                    probe_coords=probe_coords,
+                    atom_coords=type_coords,
+                    n_probes=n_probes_tensor,
+                    n_atoms=n_atoms_tensor,
+                    coeffs=type_coeffs,
+                    expo_scaling=None,
+                    reorder=True,
+                    pbc=False,
+                    cell=None
+                )
+                chunk_reconstructed += type_contribution
+                basis_offset += n_atoms_type * gto.outdim
+
+            results.append((probe_indices.cpu(), chunk_reconstructed.cpu()))
+
+        print(f"[{device_str}] Recon worker finished")
+        return results
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_devices) as ex:
+        futures = []
+        for i, chunks in enumerate(work_per_device):
+            if len(chunks) == 0:
                 continue
-                
-            gto = gto_dict[type_str]
-            type_mask = atom_types == atom_type
-            type_coords = atom_coords[type_mask]
-            n_atoms_type = len(type_coords)
-            
-            if n_atoms_type == 0:
-                continue  # Don't increment basis_offset if no atoms of this type
-            
-            # Get coefficients for this atom type
-            type_coeffs = coefficients[basis_offset:basis_offset + n_atoms_type * gto.outdim]
-            type_coeffs = type_coeffs.view(n_atoms_type, gto.outdim)
-            
-            # Use scdp's forward method for efficient reconstruction
-            n_probes_tensor = torch.tensor([n_probes_chunk])
-            n_atoms_tensor = torch.tensor([n_atoms_type])
-            
-            type_contribution = gto.forward(
-                probe_coords=probe_coords,
-                atom_coords=type_coords,
-                n_probes=n_probes_tensor,
-                n_atoms=n_atoms_tensor,
-                coeffs=type_coeffs,
-                expo_scaling=None,
-                reorder=True,
-                pbc=False,
-                cell=None
-            )
-            
-            chunk_reconstructed += type_contribution
-            basis_offset += n_atoms_type * gto.outdim
-        
-        # Store chunk results in full array
-        reconstructed[probe_indices] = chunk_reconstructed
-    
+            futures.append(ex.submit(_worker_recon, devices[i], chunks))
+
+        for fut in concurrent.futures.as_completed(futures):
+            for probe_idx_cpu, dens_cpu in fut.result():
+                reconstructed[probe_idx_cpu] = dens_cpu
+
     return reconstructed
-        
+
