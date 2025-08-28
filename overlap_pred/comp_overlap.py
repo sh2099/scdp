@@ -54,7 +54,8 @@ def create_gto_basis(atom_types: torch.Tensor, atom_coords: torch.Tensor,
                     basis_set_name: str = 'def2-QZVPPD', 
                     use_augmentation: bool = True,
                     beta: float = 2.0,
-                    vnode_elem: int = 1) -> Dict[str, GTOs]:
+                    vnode_elem: int = 1,
+                    silent: bool = False) -> Dict[str, GTOs]:
     """
     Create GTO basis using scdp's method, similar to ChgLightningModule.
     
@@ -65,22 +66,26 @@ def create_gto_basis(atom_types: torch.Tensor, atom_coords: torch.Tensor,
         use_augmentation: Whether to use even-tempered augmentation
         beta: Augmentation parameter
         vnode_elem: Element to use for virtual nodes (if atom_type is 0)
+        silent: If True, suppress all print output
     
     Returns:
         Dictionary mapping atom type strings to GTO objects
     """
-    print(f"Creating GTO basis with {basis_set_name}")
-    print(f"Augmentation: {use_augmentation}, beta: {beta}")
+    if not silent:
+        print(f"Creating GTO basis with {basis_set_name}")
+        print(f"Augmentation: {use_augmentation}, beta: {beta}")
     
     # Get unique atom types
     unique_atom_types = torch.unique(atom_types).tolist()
-    print(f"Unique atom types: {unique_atom_types}")
+    if not silent:
+        print(f"Unique atom types: {unique_atom_types}")
     
     # Load and transform basis set
     basis_set = transform_basis_set(get_basis_set(basis_set_name))
     
     if use_augmentation:
-        print(f"Applying even-tempered augmentation with β={beta}")
+        if not silent:
+            print(f"Applying even-tempered augmentation with β={beta}")
         basis_set = aug_etb_for_basis(
             basis_set,
             beta=beta,
@@ -97,13 +102,16 @@ def create_gto_basis(atom_types: torch.Tensor, atom_coords: torch.Tensor,
         if elem == 0:
             # Virtual nodes use specified element basis
             gto_dict['0'] = GTOs(**vbasis, cutoff=None, normalize=True)
-            print(f"Virtual nodes (type 0): using element {vnode_elem} basis")
+            if not silent:
+                print(f"Virtual nodes (type 0): using element {vnode_elem} basis")
         else:
             if elem in basis_set:
                 gto_dict[str(elem)] = GTOs(**basis_set[elem], cutoff=None, normalize=True)
-                print(f"Element {elem}: {gto_dict[str(elem)]}")
+                if not silent:
+                    print(f"Element {elem}: {gto_dict[str(elem)]}")
             else:
-                print(f"Warning: Element {elem} not found in basis set")
+                if not silent:
+                    print(f"Warning: Element {elem} not found in basis set")
     
     return gto_dict
 
@@ -111,7 +119,8 @@ def compute_overlap_integrals_scdp(molecule, gto_dict: Dict[str, GTOs],
                                   atom_coords: torch.Tensor, atom_types: torch.Tensor,
                                   max_probes_per_chunk: int = 50000,
                                   devices: Optional[List[str]] = None,
-                                  exclude_gpus: Optional[List[int]] = None) -> torch.Tensor:
+                                  exclude_gpus: Optional[List[int]] = None,
+                                  silent_gpu: bool = False) -> torch.Tensor:
     """
     Compute overlap integrals using scdp's GTO.compute() in a vectorized way
     with probe blocking. Now supports parallel processing across devices.
@@ -124,11 +133,13 @@ def compute_overlap_integrals_scdp(molecule, gto_dict: Dict[str, GTOs],
         max_probes_per_chunk: Maximum probes per chunk
         devices: List of device strings to use (if None, auto-detect)
         exclude_gpus: List of GPU indices to exclude from auto-detection
+        silent_gpu: If True, minimize GPU-related output
     
     Returns:
         Overlap integrals tensor
     """
-    print("Computing overlap integrals using scdp methods with probe blocking...")
+    if not silent_gpu:
+        print("Computing overlap integrals using scdp methods with probe blocking...")
 
     # Determine devices
     if devices is None:
@@ -137,17 +148,20 @@ def compute_overlap_integrals_scdp(molecule, gto_dict: Dict[str, GTOs],
             if exclude_gpus is not None:
                 available_gpus = [i for i in all_gpus if i not in exclude_gpus]
                 if not available_gpus:
-                    print("Warning: All GPUs excluded, falling back to CPU")
+                    if not silent_gpu:
+                        print("Warning: All GPUs excluded, falling back to CPU")
                     devices = ["cpu"]
                 else:
                     devices = [f"cuda:{i}" for i in available_gpus]
-                    if exclude_gpus:
+                    if exclude_gpus and not silent_gpu:
                         print(f"Excluded GPUs: {exclude_gpus}")
             else:
                 devices = [f"cuda:{i}" for i in all_gpus]
         else:
             devices = ["cpu"]
-    print(f"Using devices: {devices}")
+    
+    if not silent_gpu:
+        print(f"Using devices: {devices}")
 
     # Get total number of probes
     n_probes = len(molecule.probe_coords)
@@ -178,7 +192,11 @@ def compute_overlap_integrals_scdp(molecule, gto_dict: Dict[str, GTOs],
     overlaps_cpu = torch.zeros(total_basis_funcs, dtype=torch.float64)
 
     probe_chunks = get_probe_chunks(n_probes, max_probes_per_chunk)
-    print(f"Total probes: {n_probes}, chunks: {len(probe_chunks)}, total basis funcs: {total_basis_funcs}")
+    
+    if silent_gpu:
+        print(f"Processing {n_probes} probes in {len(probe_chunks)} chunks across {len(devices)} devices")
+    else:
+        print(f"Total probes: {n_probes}, chunks: {len(probe_chunks)}, total basis funcs: {total_basis_funcs}")
 
     # distribute chunks across devices (round-robin)
     n_devices = len(devices)
@@ -191,7 +209,9 @@ def compute_overlap_integrals_scdp(molecule, gto_dict: Dict[str, GTOs],
         use_cuda = (dev.type == "cuda")
         if use_cuda:
             torch.cuda.set_device(dev)
-        #print(f"[{device_str}] Worker starting with {len(chunks)} chunks")
+        
+        if not silent_gpu:
+            print(f"[{device_str}] Worker starting with {len(chunks)} chunks")
 
         # create device-local copies
         gto_dev = {k: deepcopy(v).to(dev) for k, v in gto_dict.items()}
@@ -200,7 +220,8 @@ def compute_overlap_integrals_scdp(molecule, gto_dict: Dict[str, GTOs],
         local_accum = torch.zeros(total_basis_funcs, dtype=torch.float64, device=dev)
 
         for cidx, probe_indices in enumerate(chunks):
-            print(f"[{device_str}] processing chunk {cidx+1}/{len(chunks)} ({len(probe_indices)} probes)")
+            if not silent_gpu:
+                print(f"[{device_str}] processing chunk {cidx+1}/{len(chunks)} ({len(probe_indices)} probes)")
             mol_chunk = get_molecule_probe_chunk(molecule, probe_indices)
             probe_coords = mol_chunk.probe_coords.double().to(dev)
             charge_density = mol_chunk.chg_labels.double().to(dev)
@@ -232,7 +253,8 @@ def compute_overlap_integrals_scdp(molecule, gto_dict: Dict[str, GTOs],
 
                 basis_offset += len(type_coords) * outdim
 
-        print(f"[{device_str}] Worker finished")
+        if not silent_gpu:
+            print(f"[{device_str}] Worker finished")
         return local_accum.cpu()
 
     # run workers
@@ -245,9 +267,11 @@ def compute_overlap_integrals_scdp(molecule, gto_dict: Dict[str, GTOs],
         for fut in concurrent.futures.as_completed(futures):
             overlaps_cpu += fut.result()
 
-    print(f"Computed {len(overlaps_cpu)} overlap integrals")
-    print(f"Sum of overlaps: {overlaps_cpu.sum():.6f}")
-    print(f"Total electrons: {molecule.chg_labels.sum():.6f}")
+    if not silent_gpu:
+        print(f"Computed {len(overlaps_cpu)} overlap integrals")
+        print(f"Sum of overlaps: {overlaps_cpu.sum():.6f}")
+        print(f"Total electrons: {molecule.chg_labels.sum():.6f}")
+    
     return overlaps_cpu
 
 def compute_overlap_matrix_scdp(gto_dict: Dict[str, GTOs], 
@@ -503,4 +527,251 @@ def reconstruct_density_scdp(coefficients: torch.Tensor, gto_dict: Dict[str, GTO
                 reconstructed[probe_idx_cpu] = dens_cpu
 
     return reconstructed
+
+def compute_overlap_integrals_2d_scdp(molecule, gto_dict: Dict[str, GTOs], 
+                                     atom_coords: torch.Tensor, atom_types: torch.Tensor,
+                                     max_probes_per_chunk: int = 50000,
+                                     devices: Optional[List[str]] = None,
+                                     exclude_gpus: Optional[List[int]] = None,
+                                     silent_gpu: bool = False,
+                                     silent_mapping: bool = False) -> Tuple[torch.Tensor, Dict]:
+    """
+    Compute overlap integrals as 2D matrix: exponents × (atoms, L, m hierarchy).
+    
+    Args:
+        silent_gpu: If True, minimize GPU-related output
+        silent_mapping: If True, minimize basis mapping output
+    
+    Returns:
+        overlap_matrix_2d: Shape (n_exponents, n_basis_functions)
+        mapping_info: Dictionary with mapping and structural information
+    """
+    if not silent_mapping:
+        print("Computing 2D overlap integrals organized by exponents...")
+    
+    # Get basis function mapping
+    mapping, exponent_to_basis, basis_info, atom_basis_structure = get_basis_function_mapping(
+        gto_dict, atom_types, silent=silent_mapping
+    )
+    n_exponents = basis_info['n_exponents']
+    n_basis_funcs = basis_info['total_basis_functions']
+    
+    if not silent_mapping:
+        print(f"Basis structure: {n_exponents} exponents × {n_basis_funcs} basis functions")
+    
+    # Compute regular overlap integrals
+    overlap_1d = compute_overlap_integrals_scdp(
+        molecule, gto_dict, atom_coords, atom_types, 
+        max_probes_per_chunk, devices, exclude_gpus, silent_gpu
+    )
+    
+    # Reshape into 2D matrix
+    overlap_2d = torch.zeros(n_exponents, n_basis_funcs, dtype=torch.float64)
+    
+    for exp_idx in range(n_exponents):
+        if exp_idx in exponent_to_basis:
+            basis_indices = exponent_to_basis[exp_idx]
+            overlap_2d[exp_idx, basis_indices] = overlap_1d[basis_indices]
+    
+    mapping_info = {
+        'mapping': mapping,
+        'exponent_to_basis': exponent_to_basis,
+        'basis_info': basis_info,
+        'exponent_values': basis_info['exponent_values'],
+        'atom_basis_structure': atom_basis_structure
+    }
+    
+    return overlap_2d, mapping_info
+
+def get_basis_function_mapping(gto_dict: Dict[str, GTOs], atom_types: torch.Tensor, silent: bool = False):
+    """
+    Create mapping from flat basis function index to (atom_idx, L, m, exponent_idx).
+    
+    Args:
+        silent: If True, minimize output
+    """
+    mapping = []
+    exponent_to_basis = {}
+    atom_basis_structure = {}
+    
+    basis_idx = 0
+    unique_types = torch.unique(atom_types)
+    
+    # First pass: collect all unique exponents across all atom types
+    all_exponents = set()
+    reference_gto = None
+    
+    for atom_type in unique_types:
+        type_str = str(atom_type.item())
+        if type_str in gto_dict:
+            gto = gto_dict[type_str]
+            expos = gto.expos.cpu().numpy()
+            Ls = gto.Ls.cpu().numpy()
+            
+            if reference_gto is None:
+                reference_gto = gto
+                all_exponents.update(expos)
+                if not silent:
+                    print(f"Basis mapping reference (atom type {atom_type.item()}):")
+                    print(f"  {len(expos)} exponents: {expos.min():.3e} to {expos.max():.3e}")
+                    print(f"  L values: {sorted(set(Ls))}")
+            else:
+                # Verify this GTO has the same exponents as the reference
+                ref_expos = reference_gto.expos.cpu().numpy()
+                ref_Ls = reference_gto.Ls.cpu().numpy()
+                
+                if not (np.allclose(expos, ref_expos, rtol=1e-10) and np.array_equal(Ls, ref_Ls)):
+                    if not silent:
+                        print(f"WARNING: Atom type {atom_type.item()} has different basis!")
+                else:
+                    if not silent:
+                        print(f"✓ Atom type {atom_type.item()} matches reference basis")
+                    
+                all_exponents.update(expos)
+    
+    # Sort exponents for consistent ordering
+    sorted_exponents = sorted(all_exponents)
+    exp_to_idx = {exp: idx for idx, exp in enumerate(sorted_exponents)}
+    
+    if not silent:
+        print(f"\nBasis verification summary:")
+        print(f"  Total unique atom types: {len(unique_types)}")
+        print(f"  Final exponent set: {len(sorted_exponents)} unique exponents")
+        print(f"  Range: {min(sorted_exponents):.3e} to {max(sorted_exponents):.3e}")
+    
+    # Second pass: build mapping and structure
+    for atom_idx, atom_type in enumerate(atom_types):
+        type_str = str(atom_type.item())
+        if type_str not in gto_dict:
+            continue
+            
+        atom_basis_structure[atom_idx] = {}
+        gto = gto_dict[type_str]
+        Ls = gto.Ls.cpu().numpy()
+        expos = gto.expos.cpu().numpy()
+        
+        # Group by contraction (if available)
+        if hasattr(gto, 'contraction') and gto.contraction is not None:
+            contractions = gto.contraction.cpu().numpy()
+            unique_contractions = sorted(set(contractions))
+            
+            for contraction_idx in unique_contractions:
+                mask = contractions == contraction_idx
+                L = Ls[mask][0]  # All primitives in same contraction have same L
+                
+                if L not in atom_basis_structure[atom_idx]:
+                    atom_basis_structure[atom_idx][L] = {}
+                
+                # All m values for this L
+                for m in range(-L, L + 1):
+                    if m not in atom_basis_structure[atom_idx][L]:
+                        atom_basis_structure[atom_idx][L][m] = []
+                    
+                    for prim_idx in range(len(Ls[mask])):
+                        exp_val = expos[mask][prim_idx]
+                        exp_idx = exp_to_idx[exp_val]
+                        
+                        mapping.append((atom_idx, L, m, exp_idx, exp_val))
+                        atom_basis_structure[atom_idx][L][m].append({
+                            'basis_idx': basis_idx,
+                            'exp_idx': exp_idx,
+                            'exp_val': exp_val
+                        })
+                        
+                        if exp_idx not in exponent_to_basis:
+                            exponent_to_basis[exp_idx] = []
+                        exponent_to_basis[exp_idx].append(basis_idx)
+                        
+                        basis_idx += 1
+        else:
+            # No contraction - each primitive is separate
+            for i, (L, exp_val) in enumerate(zip(Ls, expos)):
+                exp_idx = exp_to_idx[exp_val]
+                
+                if L not in atom_basis_structure[atom_idx]:
+                    atom_basis_structure[atom_idx][L] = {}
+                
+                for m in range(-L, L + 1):
+                    if m not in atom_basis_structure[atom_idx][L]:
+                        atom_basis_structure[atom_idx][L][m] = []
+                    
+                    mapping.append((atom_idx, L, m, exp_idx, exp_val))
+                    atom_basis_structure[atom_idx][L][m].append({
+                        'basis_idx': basis_idx,
+                        'exp_idx': exp_idx,
+                        'exp_val': exp_val
+                    })
+                    
+                    if exp_idx not in exponent_to_basis:
+                        exponent_to_basis[exp_idx] = []
+                    exponent_to_basis[exp_idx].append(basis_idx)
+                    
+                    basis_idx += 1
+    
+    basis_info = {
+        'total_basis_functions': basis_idx,
+        'n_exponents': len(sorted_exponents),
+        'exponent_values': sorted_exponents,
+        'n_atoms': len(atom_types)
+    }
+    
+    if not silent:
+        print(f"Final verification: {len(sorted_exponents)} exponents mapped to {basis_idx} basis functions")
+    
+    return mapping, exponent_to_basis, basis_info, atom_basis_structure
+
+def compute_overlap_integrals_2d_scdp(molecule, gto_dict: Dict[str, GTOs], 
+                                     atom_coords: torch.Tensor, atom_types: torch.Tensor,
+                                     max_probes_per_chunk: int = 50000,
+                                     devices: Optional[List[str]] = None,
+                                     exclude_gpus: Optional[List[int]] = None,
+                                     silent_gpu: bool = False,
+                                     silent_mapping: bool = False) -> Tuple[torch.Tensor, Dict]:
+    """
+    Compute overlap integrals as 2D matrix: exponents × (atoms, L, m hierarchy).
+    
+    Args:
+        silent_gpu: If True, minimize GPU-related output
+        silent_mapping: If True, minimize basis mapping output
+    
+    Returns:
+        overlap_matrix_2d: Shape (n_exponents, n_basis_functions)
+        mapping_info: Dictionary with mapping and structural information
+    """
+    if not silent_mapping:
+        print("Computing 2D overlap integrals organized by exponents...")
+    
+    # Get basis function mapping
+    mapping, exponent_to_basis, basis_info, atom_basis_structure = get_basis_function_mapping(
+        gto_dict, atom_types, silent=silent_mapping
+    )
+    n_exponents = basis_info['n_exponents']
+    n_basis_funcs = basis_info['total_basis_functions']
+    
+    if not silent_mapping:
+        print(f"Basis structure: {n_exponents} exponents × {n_basis_funcs} basis functions")
+    
+    # Compute regular overlap integrals
+    overlap_1d = compute_overlap_integrals_scdp(
+        molecule, gto_dict, atom_coords, atom_types, 
+        max_probes_per_chunk, devices, exclude_gpus, silent_gpu
+    )
+    
+    # Reshape into 2D matrix
+    overlap_2d = torch.zeros(n_exponents, n_basis_funcs, dtype=torch.float64)
+    
+    for exp_idx in range(n_exponents):
+        if exp_idx in exponent_to_basis:
+            basis_indices = exponent_to_basis[exp_idx]
+            overlap_2d[exp_idx, basis_indices] = overlap_1d[basis_indices]
+    
+    mapping_info = {
+        'mapping': mapping,
+        'exponent_to_basis': exponent_to_basis,
+        'basis_info': basis_info,
+        'exponent_values': basis_info['exponent_values'],
+        'atom_basis_structure': atom_basis_structure
+    }
+    
+    return overlap_2d, mapping_info
 
