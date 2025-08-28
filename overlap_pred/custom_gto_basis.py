@@ -42,9 +42,12 @@ def generate_custom_even_tempered_basis(L_values: List[int],
     if min_exp >= max_exp:
         raise ValueError(f"Invalid exponent range: min_exp ({min_exp}) >= max_exp ({max_exp})")
     
+    # Add extra headroom: extend upper limit by beta factor for safety
+    extended_max_exp = max_exp * beta
+    
     # Calculate number of exponents
     if n_exponents_per_L is None:
-        n_exp = max(1, int(np.ceil(np.log(max_exp / min_exp) / np.log(beta))))
+        n_exp = max(1, int(np.ceil(np.log(extended_max_exp / min_exp) / np.log(beta))))
     else:
         n_exp = n_exponents_per_L[0] if isinstance(n_exponents_per_L, list) else n_exponents_per_L
     
@@ -61,13 +64,15 @@ def generate_custom_even_tempered_basis(L_values: List[int],
     # Generate even-tempered exponents: alpha_i = starting_exp * beta^i
     shared_exponents = [starting_exp * (beta ** j) for j in range(n_exp)]
     
-    # Ensure we don't exceed max_exp
-    shared_exponents = [exp for exp in shared_exponents if exp <= max_exp]
+    # Apply the extended upper limit (beta * max_exp) instead of original max_exp
+    shared_exponents = [exp for exp in shared_exponents if exp <= extended_max_exp]
     if not shared_exponents:
         shared_exponents = [starting_exp]  # Fallback to at least one exponent
     
     print(f"Generated {len(shared_exponents)} shared exponents for all L values:")
-    print(f"  Range: {min(shared_exponents):.3e} to {max(shared_exponents):.3e}")
+    print(f"  Original range: {min_exp:.3e} to {max_exp:.3e}")
+    print(f"  Extended upper limit: {extended_max_exp:.3e} (β × max_exp)")
+    print(f"  Actual range: {min(shared_exponents):.3e} to {max(shared_exponents):.3e}")
     print(f"  Exponents: {[f'{e:.3e}' for e in shared_exponents[:8]]}")
     if len(shared_exponents) > 8:
         print(f"  ... and {len(shared_exponents)-8} more")
