@@ -56,7 +56,9 @@ def generate_custom_even_tempered_basis(L_values: List[int],
         # Create diversity by randomly sampling starting exponent
         # Range: (min_exp/beta, min_exp) to step slightly below the given minimum
         lower_bound = min_exp / beta
-        starting_exp = random.uniform(lower_bound, min_exp)
+        #starting_exp = random.uniform(lower_bound, min_exp)
+        # Use log-uniform distribution to get uniform normalised distribution
+        starting_exp = np.exp(np.random.uniform(np.log(lower_bound), np.log(min_exp)))
     else:
         # Use the provided minimum exponent
         starting_exp = min_exp

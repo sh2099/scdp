@@ -240,6 +240,7 @@ def compute_overlap_integrals_scdp(molecule, gto_dict: Dict[str, GTOs],
                 # vectorized evaluation for all probe-atom pairs in this type
                 vecs = (probe_coords.unsqueeze(1) - type_coords.unsqueeze(0)).reshape(-1, 3)
                 vecs = vecs[..., [1,2,0]] / 0.52917721067
+                #vecs = vecs / 0.52917721067
                 orbital_pairs = gto.compute(vecs)  # (n_pairs, outdim)
                 orbital_values = orbital_pairs.view(n_probes_chunk, len(type_coords), outdim)
 
@@ -534,7 +535,8 @@ def compute_overlap_integrals_2d_scdp(molecule, gto_dict: Dict[str, GTOs],
                                      devices: Optional[List[str]] = None,
                                      exclude_gpus: Optional[List[int]] = None,
                                      silent_gpu: bool = False,
-                                     silent_mapping: bool = False) -> Tuple[torch.Tensor, Dict]:
+                                     silent_mapping: bool = False,
+                                     compressed_format: bool = False) -> Tuple[torch.Tensor, Dict]:
     """
     Compute overlap integrals as 2D matrix: exponents × (atoms, L, m hierarchy).
     
@@ -565,23 +567,56 @@ def compute_overlap_integrals_2d_scdp(molecule, gto_dict: Dict[str, GTOs],
         max_probes_per_chunk, devices, exclude_gpus, silent_gpu
     )
     
-    # Reshape into 2D matrix
-    overlap_2d = torch.zeros(n_exponents, n_basis_funcs, dtype=torch.float64)
-    
-    for exp_idx in range(n_exponents):
-        if exp_idx in exponent_to_basis:
-            basis_indices = exponent_to_basis[exp_idx]
-            overlap_2d[exp_idx, basis_indices] = overlap_1d[basis_indices]
-    
-    mapping_info = {
-        'mapping': mapping,
-        'exponent_to_basis': exponent_to_basis,
-        'basis_info': basis_info,
-        'exponent_values': basis_info['exponent_values'],
-        'atom_basis_structure': atom_basis_structure
-    }
-    
-    return overlap_2d, mapping_info
+    if not compressed_format:
+        # Reshape into full 2D matrix (exponents x total_basis_functions)
+        overlap_2d = torch.zeros(n_exponents, n_basis_funcs, dtype=torch.float64)
+        for exp_idx in range(n_exponents):
+            if exp_idx in exponent_to_basis:
+                basis_indices = exponent_to_basis[exp_idx]
+                overlap_2d[exp_idx, basis_indices] = overlap_1d[basis_indices]
+
+        mapping_info = {
+            'mapping': mapping,
+            'exponent_to_basis': exponent_to_basis,
+            'basis_info': basis_info,
+            'exponent_values': basis_info['exponent_values'],
+            'atom_basis_structure': atom_basis_structure
+        }
+
+        return overlap_2d, mapping_info
+    else:
+        # Build compressed dense-per-exponent representation: for each exponent,
+        # pack the overlap values for the basis indices it contributes to into
+        # a contiguous row, and record the basis_indices_mapping.
+        basis_indices_mapping = []
+        for exp_idx in range(n_exponents):
+            if exp_idx in exponent_to_basis:
+                basis_indices_mapping.append(list(exponent_to_basis[exp_idx]))
+            else:
+                basis_indices_mapping.append([])
+
+        max_basis_per_exp = max((len(lst) for lst in basis_indices_mapping), default=0)
+
+        if max_basis_per_exp == 0:
+            dense_overlap = None
+        else:
+            dense_overlap = torch.zeros((n_exponents, max_basis_per_exp), dtype=torch.float64)
+            for exp_idx, basis_list in enumerate(basis_indices_mapping):
+                if not basis_list:
+                    continue
+                vals = overlap_1d[basis_list]
+                dense_overlap[exp_idx, : len(basis_list)] = vals
+
+        mapping_info = {
+            'mapping': mapping,
+            'exponent_to_basis': exponent_to_basis,
+            'basis_indices_mapping': basis_indices_mapping,
+            'basis_info': basis_info,
+            'exponent_values': basis_info['exponent_values'],
+            'atom_basis_structure': atom_basis_structure
+        }
+
+        return dense_overlap, mapping_info
 
 def get_basis_function_mapping(gto_dict: Dict[str, GTOs], atom_types: torch.Tensor, silent: bool = False):
     """
@@ -720,58 +755,5 @@ def get_basis_function_mapping(gto_dict: Dict[str, GTOs], atom_types: torch.Tens
     
     return mapping, exponent_to_basis, basis_info, atom_basis_structure
 
-def compute_overlap_integrals_2d_scdp(molecule, gto_dict: Dict[str, GTOs], 
-                                     atom_coords: torch.Tensor, atom_types: torch.Tensor,
-                                     max_probes_per_chunk: int = 50000,
-                                     devices: Optional[List[str]] = None,
-                                     exclude_gpus: Optional[List[int]] = None,
-                                     silent_gpu: bool = False,
-                                     silent_mapping: bool = False) -> Tuple[torch.Tensor, Dict]:
-    """
-    Compute overlap integrals as 2D matrix: exponents × (atoms, L, m hierarchy).
-    
-    Args:
-        silent_gpu: If True, minimize GPU-related output
-        silent_mapping: If True, minimize basis mapping output
-    
-    Returns:
-        overlap_matrix_2d: Shape (n_exponents, n_basis_functions)
-        mapping_info: Dictionary with mapping and structural information
-    """
-    if not silent_mapping:
-        print("Computing 2D overlap integrals organized by exponents...")
-    
-    # Get basis function mapping
-    mapping, exponent_to_basis, basis_info, atom_basis_structure = get_basis_function_mapping(
-        gto_dict, atom_types, silent=silent_mapping
-    )
-    n_exponents = basis_info['n_exponents']
-    n_basis_funcs = basis_info['total_basis_functions']
-    
-    if not silent_mapping:
-        print(f"Basis structure: {n_exponents} exponents × {n_basis_funcs} basis functions")
-    
-    # Compute regular overlap integrals
-    overlap_1d = compute_overlap_integrals_scdp(
-        molecule, gto_dict, atom_coords, atom_types, 
-        max_probes_per_chunk, devices, exclude_gpus, silent_gpu
-    )
-    
-    # Reshape into 2D matrix
-    overlap_2d = torch.zeros(n_exponents, n_basis_funcs, dtype=torch.float64)
-    
-    for exp_idx in range(n_exponents):
-        if exp_idx in exponent_to_basis:
-            basis_indices = exponent_to_basis[exp_idx]
-            overlap_2d[exp_idx, basis_indices] = overlap_1d[basis_indices]
-    
-    mapping_info = {
-        'mapping': mapping,
-        'exponent_to_basis': exponent_to_basis,
-        'basis_info': basis_info,
-        'exponent_values': basis_info['exponent_values'],
-        'atom_basis_structure': atom_basis_structure
-    }
-    
-    return overlap_2d, mapping_info
+
 

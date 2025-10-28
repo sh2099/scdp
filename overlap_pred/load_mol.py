@@ -34,12 +34,12 @@ def load_molecule_with_override(idx: int = 0, vnode: bool = False, override_atom
         splits = json.load(fp)
     
     # Create subset and loader - handle both split-based and direct indexing
-    if idx < len(splits['train']):
-        # Use training split index mapping
-        actual_idx = splits['train'][idx]
-    else:
+    #if idx < len(splits['train']):
+    #    # Use training split index mapping
+    #    actual_idx = splits['train'][idx]
+    #else:
         # Direct dataset index for full dataset processing
-        actual_idx = idx
+    actual_idx = idx
     
     single_mol_dataset = Subset(dataset, [actual_idx])
     data_loader = DataLoader(
@@ -52,6 +52,7 @@ def load_molecule_with_override(idx: int = 0, vnode: bool = False, override_atom
     
     # Load the molecule
     molecule = next(iter(data_loader))
+    print(f'yes: {molecule.id}')
     
     # Get molecule ID for identification - handle list format
     raw_id = molecule.id if hasattr(molecule, 'id') and molecule.id is not None else f"idx_{idx}"
@@ -238,14 +239,14 @@ def get_dataset_size(vnode: bool = False) -> int:
 
 if __name__ == "__main__":
     # Test the new loader
-    molecule = load_molecule_with_override(idx=36729, vnode=True, override_atom_type=6)
+    molecule = load_molecule_with_override(idx=37009, vnode=True, override_atom_type=6)
     print(molecule.id)
     coords, types, info = get_atom_centers_and_types(molecule, use_vnodes=True)
     print(f"\nExtracted {len(coords)} centers with types {types.unique().tolist()}")
 
 if __name__ == "__main__":
     # Test the new loader
-    molecule = load_molecule_with_override(idx=36729, vnode=True, override_atom_type=6)
+    molecule = load_molecule_with_override(idx=37000, vnode=True, override_atom_type=6)
     print(molecule.id)
     coords, types, info = get_atom_centers_and_types(molecule, use_vnodes=True)
     print(f"\nExtracted {len(coords)} centers with types {types.unique().tolist()}")
