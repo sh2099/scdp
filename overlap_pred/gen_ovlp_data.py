@@ -8,7 +8,8 @@ from typing import List, Dict, Optional, Union
 from overlap_pred.load_mol import load_molecule_with_override, get_atom_centers_and_types
 from overlap_pred.comp_overlap import create_gto_basis, compute_overlap_integrals_2d_scdp
 from overlap_pred.custom_gto_basis import create_gto_basis_custom, validate_custom_basis_parameters
-from overlap_pred.custom_data import CustomMolecule
+# Use the new final CustomMolecule implementation (v2)
+from overlap_pred.custom_data_2 import CustomMolecule
 
 # Set default dtype to double precision
 torch.set_default_dtype(torch.float64)
@@ -223,6 +224,7 @@ def process_molecule_to_custom_data(
     # Get molecule ID for proper identification - handle list format
     raw_id = molecule.id if hasattr(molecule, 'id') and molecule.id is not None else f"idx_{molecule_idx}"
     if isinstance(raw_id, (list, tuple)) and len(raw_id) > 0:
+        # Preserve the original string format of the first element
         molecule_id = str(raw_id[0])
     else:
         molecule_id = str(raw_id) if raw_id is not None else f"idx_{molecule_idx}"
@@ -399,74 +401,129 @@ def process_molecule_to_custom_data(
         print("\n4. Computing 2D overlap integrals...")
     
     start_time = time.time()
-    overlap_int_2d, mapping_info = compute_overlap_integrals_2d_scdp(
-        molecule, gto_dict, atom_coords, atom_types, max_probes_per_chunk, 
+    # Request compressed_format so the function returns the packed per-exponent
+    # dense matrix and a mapping that includes 'basis_indices_mapping'. This
+    # avoids reshaping later and ensures consistency with the compression logic.
+    dense_overlap, mapping_info = compute_overlap_integrals_2d_scdp(
+        molecule, gto_dict, atom_coords, atom_types, max_probes_per_chunk,
         devices=devices, exclude_gpus=exclude_gpus,
-        silent_gpu=silent_gpu, silent_mapping=silent_basis_analysis
+        silent_gpu=silent_gpu, silent_mapping=silent_basis_analysis,
+        compressed_format=True
     )
     overlap_time = time.time() - start_time
-    
+
     if not silent_basis_analysis:
         print(f"   Overlap computation time: {overlap_time:.2f}s")
-        print(f"   Overlap integrals matrix shape: {overlap_int_2d.shape}")
-    
-    # Print detailed overlap analysis (optional)
-    if show_overlap_analysis and not silent_basis_analysis:
-        print_overlap_analysis_table(
-            overlap_int_2d, mapping_info, atom_coords, atom_types,
-            max_atoms_display=1, max_exponents_display=15,
-            L_values_to_show=show_L_values
-        )
-    
-    # Convert to CPU and double precision for storage
-    overlap_int_2d_storage = overlap_int_2d.double().cpu()
-    
-    # Create a serializable version of mapping_info
+        if dense_overlap is None:
+            print("   No overlap contributions found (dense overlap is None)")
+        else:
+            print(f"   Dense per-exponent overlap shape: {dense_overlap.shape}")
+
+    # If detailed analysis requested, temporarily reconstruct the full 2D
+    # overlap matrix from the dense per-exponent representation for display
+    if show_overlap_analysis and not silent_basis_analysis and dense_overlap is not None:
+        basis_info = mapping_info.get('basis_info', {})
+        n_exps = basis_info.get('n_exponents')
+        n_basis = basis_info.get('total_basis_functions')
+        if n_exps and n_basis:
+            overlap_2d_for_display = torch.zeros(n_exps, n_basis, dtype=dense_overlap.dtype)
+            basis_indices_mapping = mapping_info.get('basis_indices_mapping', [])
+            for exp_idx, basis_list in enumerate(basis_indices_mapping):
+                if not basis_list:
+                    continue
+                overlap_2d_for_display[exp_idx, basis_list] = dense_overlap[exp_idx, : len(basis_list)]
+
+            print_overlap_analysis_table(
+                overlap_2d_for_display, mapping_info, atom_coords, atom_types,
+                max_atoms_display=1, max_exponents_display=15,
+                L_values_to_show=show_L_values
+            )
+
+    # Convert dense overlap to CPU and double precision for storage (if present)
+    dense_overlap_storage = dense_overlap.double().cpu() if dense_overlap is not None else None
+
+    # Create a serializable version of mapping_info (keep exponent_to_basis as str keys)
     mapping_info_storage = {
-        'mapping': mapping_info['mapping'],  # List of tuples - already serializable
-        'exponent_to_basis': {str(k): v for k, v in mapping_info['exponent_to_basis'].items()},  # Convert int keys to str
-        'basis_info': mapping_info['basis_info'],
-        'exponent_values': mapping_info['exponent_values'],
-        'atom_basis_structure': mapping_info['atom_basis_structure']
+        'mapping': mapping_info.get('mapping'),
+        'exponent_to_basis': {str(k): v for k, v in mapping_info.get('exponent_to_basis', {}).items()} if mapping_info.get('exponent_to_basis') else {},
+        'basis_indices_mapping': mapping_info.get('basis_indices_mapping'),
+        'basis_info': mapping_info.get('basis_info'),
+        'exponent_values': mapping_info.get('exponent_values'),
+        'atom_basis_structure': mapping_info.get('atom_basis_structure')
     }
+
+    # Compute summary statistics for logging using only the actual non-padded values
+    if dense_overlap_storage is not None and mapping_info_storage.get('basis_indices_mapping'):
+        all_vals = []
+        for exp_idx, basis_list in enumerate(mapping_info_storage['basis_indices_mapping']):
+            if basis_list:
+                vals = dense_overlap_storage[exp_idx, : len(basis_list)].flatten()
+                all_vals.append(vals)
+        if all_vals:
+            concat = torch.cat(all_vals)
+            overlap_integral_sum = float(concat.sum().item())
+            overlap_integral_mean = float(concat.mean().item())
+            overlap_integral_std = float(concat.std().item())
+            overlap_integral_max = float(concat.max().item())
+            overlap_integral_min = float(concat.min().item())
+        else:
+            overlap_integral_sum = overlap_integral_mean = overlap_integral_std = overlap_integral_max = overlap_integral_min = 0.0
+    else:
+        overlap_integral_sum = overlap_integral_mean = overlap_integral_std = overlap_integral_max = overlap_integral_min = 0.0
     
-    # Compute summary statistics for logging (using 1D equivalent)
-    overlap_integrals_1d = overlap_int_2d.sum(dim=0)  # Sum over exponents
-    overlap_integral_sum = float(overlap_integrals_1d.sum().item())
-    overlap_integral_mean = float(overlap_integrals_1d.mean().item())
-    overlap_integral_std = float(overlap_integrals_1d.std().item())
-    overlap_integral_max = float(overlap_integrals_1d.max().item())
-    overlap_integral_min = float(overlap_integrals_1d.min().item())
+    # Only print overlap summary if not in silent mode
+    if not silent_basis_analysis:
+        print(f"\n   2D Overlap integrals matrix summary:")
+        # Report shape: prefer original sparse shape if available, otherwise report dense-per-exponent shape
+        if mapping_info_storage.get('basis_info'):
+            bi = mapping_info_storage['basis_info']
+            shape_str = (bi.get('n_exponents'), bi.get('total_basis_functions'))
+        elif dense_overlap_storage is not None:
+            shape_str = tuple(dense_overlap_storage.shape)
+        else:
+            shape_str = None
+        print(f"     Shape: {shape_str}")
+        print(f"     Sum: {overlap_integral_sum:.6e}")
+        print(f"     Mean: {overlap_integral_mean:.6e}")
+        print(f"     Std: {overlap_integral_std:.6e}")
+        print(f"     Min/Max: {overlap_integral_min:.6e} / {overlap_integral_max:.6e}")
     
-    # 2D matrix statistics
-    overlap_2d_sum = float(overlap_int_2d.sum().item())
-    overlap_2d_mean = float(overlap_int_2d.mean().item())
-    overlap_2d_std = float(overlap_int_2d.std().item())
-    overlap_2d_max = float(overlap_int_2d.max().item())
-    overlap_2d_min = float(overlap_int_2d.min().item())
+    # Step 5: Create CustomMolecule (v2) object with 2D overlap data
+    if not silent_basis_analysis:
+        print("\n5. Creating CustomMolecule object...")
     
-    print(f"\n   2D Overlap integrals matrix summary:")
-    print(f"     Shape: {overlap_int_2d.shape}")
-    print(f"     Sum: {overlap_2d_sum:.6e}")
-    print(f"     Mean: {overlap_2d_mean:.6e}")
-    print(f"     Std: {overlap_2d_std:.6e}")
-    print(f"     Min/Max: {overlap_2d_min:.6e} / {overlap_2d_max:.6e}")
-    print(f"   1D equivalent (summed over exponents):")
-    print(f"     Sum: {overlap_integral_sum:.6e}")
-    print(f"     Mean: {overlap_integral_mean:.6e}")
-    print(f"     Std: {overlap_integral_std:.6e}")
-    print(f"     Min/Max: {overlap_integral_min:.6e} / {overlap_integral_max:.6e}")
-    
-    # Step 5: Create CustomMolecule object with 2D overlap data
-    print("\n5. Creating CustomMolecule object...")
-    custom_molecule = CustomMolecule.from_scdp_data(
-        molecule.cpu(),  # Move back to CPU for storage
-        overlap_int_2d=overlap_int_2d_storage,  # Store the 2D matrix
-        overlap_mapping_info=mapping_info_storage,  # Store the mapping information
-        keep_probe_grid=False  # Don't keep heavy grid data
+    from overlap_pred.compressed_custom_data import CompressedCustomMolecule
+
+    # Use the dense per-exponent representation returned by compute_overlap_integrals_2d_scdp
+    dense_overlap_matrix = dense_overlap_storage
+    basis_indices_mapping = mapping_info_storage.get('basis_indices_mapping')
+
+    # Determine original sparse shape from basis_info if available
+    orig_shape = None
+    if mapping_info_storage.get('basis_info'):
+        bi = mapping_info_storage['basis_info']
+        orig_shape = (bi.get('n_exponents'), bi.get('total_basis_functions'))
+
+    # Build a CompressedCustomMolecule instance and convert to v2 CustomMolecule
+    compressed = CompressedCustomMolecule(
+        atom_types=atom_types.cpu(),
+        coords=atom_coords.cpu(),
+        id=molecule_id,
+        metadata={},
+        n_atom=int(len(atom_types)),
+        build_method=basis_type,
+        dense_overlap_matrix=dense_overlap_matrix,
+        basis_indices_mapping=basis_indices_mapping,
+        exponent_values=torch.as_tensor(mapping_info_storage['exponent_values']) if mapping_info_storage.get('exponent_values') is not None else None,
+        original_sparse_shape=orig_shape,
+        atom_basis_structure=mapping_info.get('atom_basis_structure'),
+        basis_info=mapping_info.get('basis_info')
     )
-    
-    # Add additional metadata including molecule ID and dataset index
+
+    # Convert compressed representation to the final CustomMolecule (v2)
+    custom_molecule = compressed.to_custom_molecule_v2()
+
+    # Add additional metadata including molecule ID and dataset index and mapping
     metadata_update = {
         'molecule_id': molecule_id,
         'dataset_index': molecule_idx,
@@ -477,22 +534,17 @@ def process_molecule_to_custom_data(
         'basis_type': basis_type,
         'use_custom_gtos': use_custom_gtos,
         'overlap_int_2d_statistics': {
-            'sum': overlap_2d_sum,
-            'mean': overlap_2d_mean,
-            'std': overlap_2d_std,
-            'min': overlap_2d_min,
-            'max': overlap_2d_max,
-            'shape': list(overlap_int_2d.shape),
-            'n_exponents': overlap_int_2d.shape[0],
-            'n_basis_functions': overlap_int_2d.shape[1]
-        },
-        'overlap_statistics_1d_equivalent': {
             'sum': overlap_integral_sum,
             'mean': overlap_integral_mean,
             'std': overlap_integral_std,
             'min': overlap_integral_min,
             'max': overlap_integral_max,
-            'shape': list(overlap_integrals_1d.shape)
+            'n_exponents': mapping_info_storage.get('basis_info', {}).get('n_exponents'),
+            'n_basis_functions': mapping_info_storage.get('basis_info', {}).get('total_basis_functions'),
+            'shape': [
+                mapping_info_storage.get('basis_info', {}).get('n_exponents'),
+                mapping_info_storage.get('basis_info', {}).get('total_basis_functions')
+            ] if mapping_info_storage.get('basis_info') else None
         },
         'processing_time': {
             'load_time': load_time,
@@ -506,13 +558,230 @@ def process_molecule_to_custom_data(
     
     if use_custom_gtos:
         metadata_update['custom_gto_config'] = diversity_config  # Store the actual config used
-    
+
+    # Include the full mapping info in metadata for downstream tools that
+    # expect an "overlap_mapping_info" attribute.
+    metadata_update['overlap_mapping_info'] = mapping_info_storage
+    # Also include atom_basis_structure and basis_info for convenience
+    metadata_update['atom_basis_structure'] = mapping_info_storage.get('atom_basis_structure')
+    metadata_update['basis_info'] = mapping_info_storage.get('basis_info')
+
+    # Update the object's metadata
+    if custom_molecule.metadata is None:
+        custom_molecule.metadata = {}
     custom_molecule.metadata.update(metadata_update)
     
     if not silent_basis_analysis:
         print(f"   CustomMolecule created for {molecule_id}: {custom_molecule}")
     
     return custom_molecule
+
+def process_molecules_batch(
+    molecule_indices: List[int],
+    output_dir: str,
+    basis_set_name: str = 'def2-QZVPPD',
+    use_augmentation: bool = True,
+    beta: float = 2.0,
+    use_vnodes: bool = True,
+    override_atom_type: Optional[int] = None,
+    vnode_elem: int = 1,
+    max_probes_per_chunk: int = 50000,
+    device: str = 'cpu',
+    devices: Optional[List[str]] = None,
+    exclude_gpus: Optional[List[int]] = None,
+    save_interval: int = 10,
+    use_custom_gtos: bool = False,
+    custom_gto_config: Optional[Dict] = None,
+    show_L_values: Optional[List[int]] = None,
+    silent_basis_analysis: bool = False,
+    silent_gpu: bool = False,
+    show_overlap_analysis: bool = True,
+    use_direct_indexing: bool = False
+) -> Dict[int, str]:
+    """
+    Process a batch of molecules and save them as CustomMolecule pickle files.
+    
+    Args:
+        silent_basis_analysis: If True, minimize basis analysis output
+        silent_gpu: If True, minimize GPU computation output  
+        show_overlap_analysis: If True, show detailed overlap analysis table
+        use_direct_indexing: If True, use direct dataset indexing
+        (other args same as before)
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\n{'#'*80}")
+    print(f"BATCH PROCESSING {len(molecule_indices)} MOLECULES")
+    print(f"Output directory: {output_path}")
+    if not silent_basis_analysis:
+        print(f"Basis set: {basis_set_name}")
+        print(f"Virtual nodes: {use_vnodes}")
+        print(f"Atom type override: {override_atom_type}")
+        print(f"Custom GTOs: {use_custom_gtos}")
+        if use_custom_gtos:
+            print(f"Custom GTO config: {custom_gto_config}")
+    print(f"{'#'*80}")
+    
+    results = {}
+    successful = 0
+    failed = 0
+    
+    batch_start_time = time.time()
+    
+    # Create log file path for periodic updates
+    log_file = output_path / "processing_log.csv"
+    
+    for i, mol_idx in enumerate(molecule_indices):
+        # Try processing with progressively smaller chunk sizes if CUDA OOM occurs
+        current_chunk_size = max_probes_per_chunk
+        min_chunk_size = 5000  # Minimum chunk size to try
+        chunk_reduction = 10000  # Reduce by this amount each retry
+        
+        molecule_processed = False
+        attempt = 1
+        max_attempts = max(1, (max_probes_per_chunk - min_chunk_size) // chunk_reduction + 1)
+        
+        while not molecule_processed and current_chunk_size >= min_chunk_size:
+            try:
+                if attempt > 1:
+                    print(f"   Attempt {attempt}/{max_attempts} for molecule {mol_idx} with chunk size {current_chunk_size}")
+                
+                # Process molecule
+                custom_mol = process_molecule_to_custom_data(
+                    molecule_idx=mol_idx,
+                    basis_set_name=basis_set_name,
+                    use_augmentation=use_augmentation,
+                    beta=beta,
+                    use_vnodes=use_vnodes,
+                    override_atom_type=override_atom_type,
+                    vnode_elem=vnode_elem,
+                    max_probes_per_chunk=current_chunk_size,  # Use current chunk size
+                    device=device,
+                    devices=devices,
+                    exclude_gpus=exclude_gpus,
+                    use_custom_gtos=use_custom_gtos,
+                    custom_gto_config=custom_gto_config,
+                    show_L_values=show_L_values,
+                    silent_basis_analysis=silent_basis_analysis,
+                    silent_gpu=silent_gpu,
+                    show_overlap_analysis=show_overlap_analysis,
+                    use_direct_indexing=use_direct_indexing
+                )
+                
+                # Generate output filename using molecule ID - preserve original formatting
+                # Get the molecule ID directly from the CustomMolecule object (which preserves formatting)
+                molecule_id = custom_mol.id
+                
+                # If molecule_id is still a complex object, extract it properly
+                if isinstance(molecule_id, (list, tuple)) and len(molecule_id) > 0:
+                    molecule_id = str(molecule_id[0])
+                elif molecule_id is not None:
+                    molecule_id = str(molecule_id)
+                else:
+                    # Fallback to using the metadata if ID is None
+                    molecule_id = custom_mol.metadata.get('molecule_id', f'idx_{mol_idx}')
+                
+                # Clean the molecule ID for use in filename (replace any problematic characters)
+                # But preserve underscores and leading zeros
+                safe_molecule_id = molecule_id.replace('/', '_').replace('\\', '_').replace(':', '_')
+                
+                vnode_suffix = "_vnodes" if use_vnodes else ""
+                override_suffix = f"_override{override_atom_type}" if override_atom_type else ""
+                aug_suffix = "_aug" if use_augmentation else ""
+                custom_suffix = "_custom" if use_custom_gtos else ""
+                basis_name = "custom" if use_custom_gtos else basis_set_name
+                filename = f"molecule_{safe_molecule_id}{vnode_suffix}{override_suffix}{aug_suffix}{custom_suffix}_{basis_name}.pkl"
+                output_file = output_path / filename
+                
+                # Save to pickle
+                custom_mol.save_pickle(output_file)
+                
+                results[mol_idx] = str(output_file)
+                successful += 1
+                molecule_processed = True
+                
+                # Log success message with chunk size info if retry was needed
+                if attempt > 1:
+                    print(f"   ✓ Saved {molecule_id} to: {output_file} (succeeded with chunk size {current_chunk_size})")
+                else:
+                    print(f"   ✓ Saved {molecule_id} to: {output_file}")
+                
+            except Exception as e:
+                error_str = str(e).lower()
+                
+                # Check if this is a CUDA out of memory error
+                is_cuda_oom = any(keyword in error_str for keyword in [
+                    'cuda out of memory', 'out of memory', 'cuda_out_of_memory', 
+                    'cudaerroroutofmemory', 'runtime error: cuda out of memory'
+                ])
+                
+                if is_cuda_oom and current_chunk_size > min_chunk_size:
+                    # Reduce chunk size and try again
+                    current_chunk_size = max(min_chunk_size, current_chunk_size - chunk_reduction)
+                    attempt += 1
+                    
+                    print(f"   ⚠ CUDA OOM error for molecule {mol_idx}, retrying with chunk size {current_chunk_size}")
+                    
+                    # Clear CUDA cache before retry
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        import gc
+                        gc.collect()
+                    
+                    continue  # Try again with smaller chunk size
+                else:
+                    # Either not a CUDA OOM error, or we've exhausted retry options
+                    if is_cuda_oom:
+                        print(f"   ✗ Failed to process molecule {mol_idx} due to CUDA OOM even with minimum chunk size {current_chunk_size}")
+                    else:
+                        print(f"   ✗ Failed to process molecule {mol_idx}: {e}")
+                    
+                    results[mol_idx] = f"FAILED: {e}"
+                    failed += 1
+                    molecule_processed = True  # Stop trying
+        
+        # If we exhausted all attempts without success
+        if not molecule_processed:
+            print(f"   ✗ Failed to process molecule {mol_idx} after {max_attempts} attempts")
+            results[mol_idx] = f"FAILED: CUDA OOM - exhausted all chunk size reductions"
+            failed += 1
+        
+        # Progress update and log saving every 20 molecules
+        if (i + 1) % 20 == 0 or (i + 1) == len(molecule_indices):
+            elapsed = time.time() - batch_start_time
+            progress = (i + 1) / len(molecule_indices)
+            estimated_total = elapsed / progress if progress > 0 else 0
+            remaining = estimated_total - elapsed
+            
+            print(f"\n{'='*40}")
+            print(f"PROGRESS: {i+1}/{len(molecule_indices)} ({progress*100:.1f}%)")
+            print(f"Successful: {successful}, Failed: {failed}")
+            print(f"Elapsed: {elapsed:.1f}s, Est. remaining: {remaining:.1f}s")
+            
+            # Save log file every 20 molecules
+            save_processing_log(results, str(log_file))
+            print(f"Log updated: {log_file}")
+            print(f"{'='*40}")
+        
+        # Clear memory periodically (every 20 molecules, same as log saving)
+        if (i + 1) % 20 == 0:
+            clear_memory()
+    
+    # Final progress summary
+    print(f"\n{'='*40}")
+    print(f"PROCESSING SUMMARY")
+    print(f"Total molecules: {len(molecule_indices)}")
+    print(f"Successful: {successful}")
+    print(f"Failed: {failed}")
+    print(f"Elapsed time: {time.time() - batch_start_time:.2f}s")
+    
+    # Save final log
+    save_processing_log(results, str(log_file))
+    print(f"Final log saved: {log_file}")
+    print(f"{'='*40}")
+    
+    return results
 
 def process_full_dataset(
     output_dir: str,
@@ -568,7 +837,7 @@ def process_full_dataset(
     print(f"{'#'*80}")
     
     # Process with production settings (minimal output)
-    return process_molecules_batch(
+    results = process_molecules_batch(
         molecule_indices=molecule_indices,
         output_dir=output_dir,
         basis_set_name=basis_set_name,
@@ -590,133 +859,8 @@ def process_full_dataset(
         show_overlap_analysis=False,  # Production mode
         use_direct_indexing=True     # Use direct dataset indexing
     )
-
-def process_molecules_batch(
-    molecule_indices: List[int],
-    output_dir: str,
-    basis_set_name: str = 'def2-QZVPPD',
-    use_augmentation: bool = True,
-    beta: float = 2.0,
-    use_vnodes: bool = True,
-    override_atom_type: Optional[int] = None,
-    vnode_elem: int = 1,
-    max_probes_per_chunk: int = 50000,
-    device: str = 'cpu',
-    devices: Optional[List[str]] = None,
-    exclude_gpus: Optional[List[int]] = None,
-    save_interval: int = 10,
-    use_custom_gtos: bool = False,
-    custom_gto_config: Optional[Dict] = None,
-    show_L_values: Optional[List[int]] = None,
-    silent_basis_analysis: bool = False,
-    silent_gpu: bool = False,
-    show_overlap_analysis: bool = True,
-    use_direct_indexing: bool = False
-) -> Dict[int, str]:
-    """
-    Process a batch of molecules and save them as CustomMolecule pickle files.
     
-    Args:
-        silent_basis_analysis: If True, minimize basis analysis output
-        silent_gpu: If True, minimize GPU computation output  
-        show_overlap_analysis: If True, show detailed overlap analysis table
-        use_direct_indexing: If True, use direct dataset indexing
-        (other args same as before)
-    """
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    
-    print(f"\n{'#'*80}")
-    print(f"BATCH PROCESSING {len(molecule_indices)} MOLECULES")
-    print(f"Output directory: {output_path}")
-    if not silent_basis_analysis:
-        print(f"Basis set: {basis_set_name}")
-        print(f"Virtual nodes: {use_vnodes}")
-        print(f"Atom type override: {override_atom_type}")
-        print(f"Custom GTOs: {use_custom_gtos}")
-        if use_custom_gtos:
-            print(f"Custom GTO config: {custom_gto_config}")
-    print(f"{'#'*80}")
-    
-    results = {}
-    successful = 0
-    failed = 0
-    
-    batch_start_time = time.time()
-    
-    for i, mol_idx in enumerate(molecule_indices):
-        try:
-            # Process molecule
-            custom_mol = process_molecule_to_custom_data(
-                molecule_idx=mol_idx,
-                basis_set_name=basis_set_name,
-                use_augmentation=use_augmentation,
-                beta=beta,
-                use_vnodes=use_vnodes,
-                override_atom_type=override_atom_type,
-                vnode_elem=vnode_elem,
-                max_probes_per_chunk=max_probes_per_chunk,
-                device=device,
-                devices=devices,
-                exclude_gpus=exclude_gpus,
-                use_custom_gtos=use_custom_gtos,
-                custom_gto_config=custom_gto_config,
-                show_L_values=show_L_values,
-                silent_basis_analysis=silent_basis_analysis,
-                silent_gpu=silent_gpu,
-                show_overlap_analysis=show_overlap_analysis,
-                use_direct_indexing=use_direct_indexing
-            )
-            
-            # Generate output filename using molecule ID instead of index
-            molecule_id = custom_mol.metadata.get('molecule_id', f'idx_{mol_idx}')
-            vnode_suffix = "_vnodes" if use_vnodes else ""
-            override_suffix = f"_override{override_atom_type}" if override_atom_type else ""
-            aug_suffix = "_aug" if use_augmentation else ""
-            custom_suffix = "_custom" if use_custom_gtos else ""
-            basis_name = "custom" if use_custom_gtos else basis_set_name
-            filename = f"molecule_{molecule_id}{vnode_suffix}{override_suffix}{aug_suffix}{custom_suffix}_{basis_name}.pkl"
-            output_file = output_path / filename
-            
-            # Save to pickle
-            custom_mol.save_pickle(output_file)
-            
-            results[mol_idx] = str(output_file)
-            successful += 1
-            
-            print(f"   ✓ Saved {molecule_id} to: {output_file}")
-            
-        except Exception as e:
-            print(f"   ✗ Failed to process molecule {mol_idx}: {e}")
-            results[mol_idx] = f"FAILED: {e}"
-            failed += 1
-        
-        # Progress update
-        if (i + 1) % save_interval == 0 or (i + 1) == len(molecule_indices):
-            elapsed = time.time() - batch_start_time
-            progress = (i + 1) / len(molecule_indices)
-            estimated_total = elapsed / progress if progress > 0 else 0
-            remaining = estimated_total - elapsed
-            
-            print(f"\n{'='*40}")
-            print(f"PROGRESS: {i+1}/{len(molecule_indices)} ({progress*100:.1f}%)")
-            print(f"Successful: {successful}, Failed: {failed}")
-            print(f"Elapsed: {elapsed:.1f}s, Est. remaining: {remaining:.1f}s")
-            print(f"{'='*40}")
-        
-        # Clear memory periodically
-        if (i + 1) % 20 == 0:
-            clear_memory()
-    
-    # Final progress summary
-    print(f"\n{'='*40}")
-    print(f"PROCESSING SUMMARY")
-    print(f"Total molecules: {len(molecule_indices)}")
-    print(f"Successful: {successful}")
-    print(f"Failed: {failed}")
-    print(f"Elapsed time: {time.time() - batch_start_time:.2f}s")
-    print(f"{'='*40}")
-    
+    # Note: Log is already saved within process_molecules_batch, no need to save again
     return results
 
 def read_molecule_indices_from_csv(csv_file: str, molecule_column: str = 'molecule_idx') -> List[int]:
@@ -783,6 +927,120 @@ def save_processing_log(results: Dict[int, str], log_file: str):
     
     print(f"Processing log saved to: {log_path}")
 
+def read_missing_molecules_file(txt_file: str) -> List[int]:
+    """
+    Read molecule indices from a txt file (like missing_files.txt) and convert
+    the 6-digit format to dataset indices.
+    
+    The txt file contains numbers like 012034, which need to be converted to
+    dataset indices. The format is: GGGNNN where GGG is the group (batch) and
+    NNN is the index within that group.
+    
+    For example:
+    - 012034 -> group 12, index 34 -> dataset_index = 12 * 1000 + 34 = 12_34
+    - 008401 -> group 8, index 401 -> dataset_index = 8 * 1000 + 401 = 8_401
+    
+    Args:
+        txt_file: Path to the text file containing 6-digit molecule numbers
+        
+    Returns:
+        List of dataset indices ready for processing
+    """
+    from pathlib import Path
+    
+    txt_path = Path(txt_file)
+    if not txt_path.exists():
+        raise FileNotFoundError(f"Missing molecules file not found: {txt_file}")
+    
+    dataset_indices = []
+    
+    with open(txt_path, 'r') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:  # Skip empty lines
+                continue
+                
+            # Validate format - should be exactly 6 digits
+            if not line.isdigit() or len(line) != 6:
+                print(f"Warning: Invalid format on line {line_num}: '{line}' (expected 6 digits)")
+                continue
+            
+            # Parse the 6-digit number: GGGNNN
+            six_digit = int(line)
+            dataset_index = six_digit - 1
+            dataset_indices.append(dataset_index)
+
+    #dataset_indices.sort()
+    print(f"Read {len(dataset_indices)} molecule indices from {txt_file}")
+    print(f"Range: {min(dataset_indices)} to {max(dataset_indices)}")
+    print(f"First 10: {dataset_indices[:10]}")
+    if len(dataset_indices) > 10:
+        print(f"Last 10: {dataset_indices[-10:]}")
+    
+    return dataset_indices
+
+def process_missing_molecules_from_file(
+    txt_file: str,
+    output_dir: str,
+    basis_set_name: str = 'def2-QZVPP',
+    use_augmentation: bool = True,
+    beta: float = 2.0,
+    use_vnodes: bool = True,
+    override_atom_type: Optional[int] = None,
+    vnode_elem: int = 1,
+    max_probes_per_chunk: int = 50000,
+    device: str = 'cpu',
+    devices: Optional[List[str]] = None,
+    exclude_gpus: Optional[List[int]] = None,
+    use_custom_gtos: bool = False,
+    custom_gto_config: Optional[Dict] = None,
+    show_L_values: Optional[List[int]] = None
+) -> Dict[int, str]:
+    """
+    Process molecules listed in a missing files txt file.
+    
+    Args:
+        txt_file: Path to text file containing 6-digit molecule numbers
+        output_dir: Directory to save the generated files
+        (other args same as process_molecules_batch)
+        
+    Returns:
+        Dictionary mapping dataset_idx to output file path
+    """
+    # Read molecule indices from file
+    molecule_indices = read_missing_molecules_file(txt_file)
+    
+    if not molecule_indices:
+        print("No valid molecule indices found in file.")
+        return {}
+    
+    print(f"\nProcessing {len(molecule_indices)} missing molecules from {txt_file}")
+    
+    # Use the existing batch processing function
+    results = process_molecules_batch(
+        molecule_indices=molecule_indices,
+        output_dir=output_dir,
+        basis_set_name=basis_set_name,
+        use_augmentation=use_augmentation,
+        beta=beta,
+        use_vnodes=use_vnodes,
+        override_atom_type=override_atom_type,
+        vnode_elem=vnode_elem,
+        max_probes_per_chunk=max_probes_per_chunk,
+        device=device,
+        devices=devices,
+        exclude_gpus=exclude_gpus,
+        use_custom_gtos=use_custom_gtos,
+        custom_gto_config=custom_gto_config,
+        show_L_values=show_L_values,
+        silent_basis_analysis=True,  # Production mode
+        silent_gpu=True,             # Production mode
+        show_overlap_analysis=False,  # Production mode
+        use_direct_indexing=True     # Use direct dataset indexing
+    )
+    
+    return results
+
 def main():
     """Main function to process molecules and create CustomMolecule pickle files."""
     
@@ -792,9 +1050,9 @@ def main():
         'use_augmentation': True,
         'beta': 2.0,
         'use_vnodes': True,
-        'override_atom_type': 8,  # Oxygen
-        'max_probes_per_chunk': 40000,
-        'exclude_gpus': [4, 6, 7],
+        'override_atom_type': None, 
+        'max_probes_per_chunk': 30000,
+        'exclude_gpus': [1],
         'device': 'cpu',
         'use_custom_gtos': True,  # Enable custom GTOs for diversity testing
         'custom_gto_config': {
@@ -809,7 +1067,9 @@ def main():
     }
     
     # Test with a small set of molecules first
-    test_molecules = [34075, 5, 343, 11797, 39941]
+    #test_molecules = [34075, 5, 343, 11797, 39941]
+    #test_molecules = np.random.choice(100000, size=20, replace=False).tolist()
+    test_molecules = [20305, 20848]
     
     # Create timestamped output directory
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -817,7 +1077,7 @@ def main():
     override_suffix = f"_override{config['override_atom_type']}" if config['override_atom_type'] else ""
     custom_suffix = "_custom" if config['use_custom_gtos'] else ""
     basis_name = "custom" if config['use_custom_gtos'] else config['basis_set_name']
-    output_dir = f"custom_molecules{vnode_suffix}{override_suffix}{custom_suffix}_{basis_name}_{timestamp}"
+    output_dir = f"/export/data/hmichael/scdp/data/full_dataset_beta={config['custom_gto_config']['beta']}_{timestamp}"
     
     print(f"Starting molecule processing...")
     print(f"Configuration: {config}")
@@ -830,9 +1090,10 @@ def main():
         **config
     )
     
+    # Note: Log is already saved within process_molecules_batch
     # Save processing log
-    log_file = f"{output_dir}/processing_log.csv"
-    save_processing_log(results, log_file)
+    # log_file = f"{output_dir}/processing_log.csv"
+    # save_processing_log(results, log_file)
     
     # Test loading one of the saved files
     successful_files = [path for path in results.values() if not path.startswith('FAILED:')]
@@ -852,28 +1113,41 @@ def main():
                 print(f"2D Overlap integrals shape: {loaded_mol.overlap_int_2d.shape}")
                 print(f"2D Overlap integrals sum: {loaded_mol.overlap_int_2d.sum():.6e}")
                 print(f"2D Overlap integrals mean: {loaded_mol.overlap_int_2d.mean():.6e}")
-                
-                # Test 1D equivalent
-                overlap_1d = loaded_mol.overlap_integrals_1d
-                if overlap_1d is not None:
-                    print(f"1D equivalent sum: {overlap_1d.sum():.6e}")
-                    print(f"1D equivalent mean: {overlap_1d.mean():.6e}")
-                
-                # Test analysis methods
-                if loaded_mol.overlap_mapping_info is not None:
-                    print(f"Number of exponents: {len(loaded_mol.overlap_mapping_info['exponent_values'])}")
-                    print(f"Exponent range: {min(loaded_mol.overlap_mapping_info['exponent_values']):.2e} to {max(loaded_mol.overlap_mapping_info['exponent_values']):.2e}")
-                    
-                    # Test L-value analysis
-                    L_analysis = loaded_mol.analyze_overlap_by_L()
-                    if L_analysis:
-                        print("L-value analysis available for atoms:", list(L_analysis.keys()))
+
+                # Test analysis methods and mapping info stored in metadata
+                mapping = loaded_mol.metadata.get('overlap_mapping_info')
+                if mapping is not None:
+                    exp_vals = mapping.get('exponent_values')
+                    try:
+                        n_exps = len(exp_vals)
+                    except Exception:
+                        n_exps = None
+                    print(f"Number of exponents: {n_exps}")
+                    try:
+                        exp_min = min(exp_vals)
+                        exp_max = max(exp_vals)
+                        print(f"Exponent range: {exp_min:.2e} to {exp_max:.2e}")
+                    except Exception:
+                        pass
+
+                    # Test L-value analysis if available on the object
+                    if hasattr(loaded_mol, 'analyze_overlap_by_L'):
+                        try:
+                            L_analysis = loaded_mol.analyze_overlap_by_L()
+                            if L_analysis:
+                                print("L-value analysis available for atoms:", list(L_analysis.keys()))
+                        except Exception:
+                            pass
             
             print(f"Metadata keys: {list(loaded_mol.metadata.keys())}")
             print(f"Basis info: {loaded_mol.metadata.get('basis_set_name', 'N/A')}")
             if 'overlap_int_2d_statistics' in loaded_mol.metadata:
                 stats = loaded_mol.metadata['overlap_int_2d_statistics']
                 print(f"2D Overlap integrals statistics: shape={stats['shape']}, sum={stats['sum']:.6e}")
+            
+            # Test the new properties method
+            print("\nAll object properties:")
+            loaded_mol.print_properties()
         except Exception as e:
             print(f"✗ Failed to load: {e}")
             import traceback
@@ -889,6 +1163,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Create CustomMolecule pickle files with overlap integrals")
     parser.add_argument("--input_csv", type=str, default=None,
                        help="Path to CSV file containing molecule indices")
+    parser.add_argument("--missing_file", type=str, default=None,
+                       help="Path to txt file with 6-digit missing molecule numbers")
     parser.add_argument("--full_dataset", action="store_true",
                        help="Process the entire dataset")
     parser.add_argument("--start_idx", type=int, default=0,
@@ -915,8 +1191,6 @@ if __name__ == "__main__":
                        help="Add diversity to custom GTO exponents")
     parser.add_argument("--diversity_seed", type=int, default=None,
                        help="Base seed for diversity (will be modified per molecule)")
-    parser.add_argument("--production_mode", action="store_true",
-                       help="Use production settings (minimal output)")
     
     args = parser.parse_args()
     
@@ -929,13 +1203,13 @@ if __name__ == "__main__":
             'use_vnodes': args.use_vnodes,
             'override_atom_type': args.override_atom_type,
             'max_probes_per_chunk': args.max_chunk_size,
-            'exclude_gpus': [4],
+            'exclude_gpus': [0,1,2],
             'device': 'cpu',
             'use_custom_gtos': args.use_custom_gtos,
             'custom_gto_config': {
                 'L_values': [0, 1, 2, 3, 4],
                 'exponent_ranges': [(8.7e-2, 5.704e+3)],
-                'beta': 20.0,
+                'beta': 2.0,
                 'n_exponents_per_L': None,
                 'add_diversity': args.add_diversity,
                 'random_seed': args.diversity_seed
@@ -952,7 +1226,7 @@ if __name__ == "__main__":
             override_suffix = f"_override{config['override_atom_type']}" if config['override_atom_type'] else ""
             custom_suffix = "_custom" if config['use_custom_gtos'] else ""
             basis_name = "custom" if config['use_custom_gtos'] else config['basis_set_name']
-            output_dir = f"full_dataset{vnode_suffix}{override_suffix}{custom_suffix}_{basis_name}_{timestamp}"
+            output_dir = f"/export/data/hmichael/scdp/data/full_dataset_beta={config['custom_gto_config']['beta']}_{timestamp}"
         
         print(f"Processing full dataset from index {args.start_idx} to {args.end_idx or 'end'}")
         print(f"Output directory: {output_dir}")
@@ -965,12 +1239,62 @@ if __name__ == "__main__":
             **config
         )
         
+        # Note: Log is already saved within process_molecules_batch
         # Save log
-        log_file = f"{output_dir}/processing_log.csv"
-        save_processing_log(results, log_file)
+        # log_file = f"{output_dir}/processing_log.csv"
+        # save_processing_log(results, log_file)
         
         print(f"Full dataset processing completed! Results in: {output_dir}")
     
+    elif args.missing_file:
+        # Process molecules from missing file
+        config = {
+            'basis_set_name': args.basis_set,
+            'use_augmentation': True,
+            'beta': 2.0,
+            'use_vnodes': args.use_vnodes,
+            'override_atom_type': args.override_atom_type,
+            'max_probes_per_chunk': args.max_chunk_size,
+            'exclude_gpus': [0, 1],
+            'device': 'cpu',
+            'use_custom_gtos': args.use_custom_gtos,
+            'custom_gto_config': {
+                'L_values': [0, 1, 2, 3, 4],
+                'exponent_ranges': [(8.7e-2, 5.74e+3)],
+                'beta': 2.0,
+                'n_exponents_per_L': None,
+                'add_diversity': args.add_diversity,
+                'random_seed': args.diversity_seed
+            },
+            'show_L_values': args.show_L_values
+        }
+        
+        # Output directory
+        if args.output_dir:
+            output_dir = args.output_dir
+        else:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            vnode_suffix = "_vnodes" if config['use_vnodes'] else ""
+            override_suffix = f"_override{config['override_atom_type']}" if config['override_atom_type'] else ""
+            custom_suffix = "_custom" if config['use_custom_gtos'] else ""
+            missing_suffix = f"_missing_{Path(args.missing_file).stem}"
+            basis_name = "custom" if config['use_custom_gtos'] else config['basis_set_name']
+            output_dir = f"/export/data/hmichael/scdp/data/missing_{timestamp}"
+        
+        print(f"Processing missing molecules from: {args.missing_file}")
+        print(f"Output directory: {output_dir}")
+        if config['use_custom_gtos']:
+            print(f"Custom GTO config: {config['custom_gto_config']}")
+        
+        # Process missing molecules
+        results = process_missing_molecules_from_file(
+            txt_file=args.missing_file,
+            output_dir=output_dir,
+            **config
+        )
+        
+        print(f"Processing completed! Results in: {output_dir}")
+        
     elif args.input_csv:
         # Read molecules from CSV
         molecule_indices = read_molecule_indices_from_csv(args.input_csv, args.molecule_column)
@@ -988,8 +1312,8 @@ if __name__ == "__main__":
             'use_custom_gtos': args.use_custom_gtos,
             'custom_gto_config': {
                 'L_values': [0, 1, 2, 3, 4],
-                'exponent_ranges': [(8.7e-2, 5.704e+3)],
-                'beta': 20.0,
+                'exponent_ranges': [(8.7e-2, 5.74e+3)],
+                'beta': 2.0,
                 'n_exponents_per_L': None,
                 'add_diversity': args.add_diversity,
                 'random_seed': args.diversity_seed
@@ -1021,11 +1345,13 @@ if __name__ == "__main__":
             **config
         )
         
+        # Note: Log is already saved within process_molecules_batch
         # Save log
-        log_file = f"{output_dir}/processing_log.csv"
-        save_processing_log(results, log_file)
+        # log_file = f"{output_dir}/processing_log.csv"
+        # save_processing_log(results, log_file)
         
         print(f"Processing completed! Results in: {output_dir}")
+
     else:
         # Run with default test molecules
         results = main()
