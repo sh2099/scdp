@@ -11,157 +11,19 @@ from overlap_pred.custom_gto_basis import create_gto_basis_custom, validate_cust
 # Use the new final CustomMolecule implementation (v2)
 from overlap_pred.custom_data_2 import CustomMolecule
 
+# Helper utilities to keep generator concise
+from overlap_pred.gen_helpers import (
+    build_mapping_storage,
+    compute_nonpadded_stats,
+    safe_shape_from_mapping,
+    format_safe_molecule_id,
+    build_custom_molecule_from_compressed,
+)
+
 # Set default dtype to double precision
 torch.set_default_dtype(torch.float64)
 
-def print_overlap_analysis_table(overlap_2d: torch.Tensor, mapping_info: Dict, 
-                                atom_coords: torch.Tensor, atom_types: torch.Tensor,
-                                max_atoms_display: int = 5, max_exponents_display: int = 10,
-                                L_values_to_show: Optional[List[int]] = None):
-    """
-    Print detailed table showing overlap values organized by exponents and atoms with L,m breakdown.
-    
-    Args:
-        overlap_2d: 2D overlap matrix (exponents x basis functions)
-        mapping_info: Dictionary containing mapping and structure information
-        atom_coords: Atom coordinates
-        atom_types: Atom types
-        max_atoms_display: Maximum number of atoms to show
-        max_exponents_display: Maximum number of exponents to show
-        L_values_to_show: List of L values to display (e.g., [0, 1] for s and p only). If None, show all.
-    """
-    mapping = mapping_info['mapping']
-    exponent_values = mapping_info['exponent_values']
-    basis_info = mapping_info['basis_info']
-    atom_basis_structure = mapping_info['atom_basis_structure']
-    
-    print(f"\n{'='*120}")
-    print("OVERLAP INTEGRALS ANALYSIS WITH L,m BREAKDOWN")
-    print(f"{'='*120}")
-    print(f"Total exponents: {len(exponent_values)}")
-    print(f"Total basis functions: {basis_info['total_basis_functions']}")
-    print(f"Total atoms: {basis_info['n_atoms']}")
-    
-    # Filter L values if specified
-    if L_values_to_show is not None:
-        print(f"Showing only L values: {L_values_to_show}")
-        # Filter atom basis structure to only include specified L values
-        filtered_atom_basis_structure = {}
-        for atom_idx, atom_struct in atom_basis_structure.items():
-            filtered_atom_basis_structure[atom_idx] = {
-                L: atom_struct[L] for L in atom_struct.keys() 
-                if L in L_values_to_show
-            }
-        atom_basis_structure = filtered_atom_basis_structure
-    
-    # Display summary for first few atoms and exponents with L,m breakdown
-    print(f"\nShowing first {max_atoms_display} atoms and {max_exponents_display} exponents:")
-    
-    # Create header with L,m subheadings
-    header_lines = ["", "", ""]  # Three lines for the header
-    
-    # First line: Exp info + Atom headers
-    header_lines[0] = f"{'Exp_Idx':<8}{'Exponent':<12}"
-    for atom_idx in range(min(max_atoms_display, len(atom_basis_structure))):
-        if atom_idx in atom_basis_structure:
-            atom_type = atom_types[atom_idx].item()
-            # Count total columns needed for this atom (only for displayed L values)
-            atom_struct = atom_basis_structure[atom_idx]
-            total_cols = sum(len(range(-L, L+1)) for L in atom_struct.keys())
-            atom_header = f"Atom_{atom_idx}(Z={atom_type})"
-            header_lines[0] += f"{atom_header:^{total_cols*12}}"
-    
-    # Second line: L value headers
-    header_lines[1] = f"{'':^8}{'':^12}"
-    for atom_idx in range(min(max_atoms_display, len(atom_basis_structure))):
-        if atom_idx in atom_basis_structure:
-            atom_struct = atom_basis_structure[atom_idx]
-            for L in sorted(atom_struct.keys()):
-                L_name = ['s', 'p', 'd', 'f', 'g', 'h'][L] if L < 6 else f'L{L}'
-                n_m_values = 2*L + 1
-                header_lines[1] += f"{L_name:^{n_m_values*12}}"
-    
-    # Third line: m value headers
-    header_lines[2] = f"{'':^8}{'':^12}"
-    for atom_idx in range(min(max_atoms_display, len(atom_basis_structure))):
-        if atom_idx in atom_basis_structure:
-            atom_struct = atom_basis_structure[atom_idx]
-            for L in sorted(atom_struct.keys()):
-                for m in range(-L, L+1):
-                    header_lines[2] += f"m={m:<9}"
-    
-    # Print headers
-    for line in header_lines:
-        print(line)
-    print("-" * len(header_lines[0]))
-    
-    # Data rows
-    for exp_idx in range(min(max_exponents_display, len(exponent_values))):
-        exp_val = exponent_values[exp_idx]
-        row = f"{exp_idx:<8}{exp_val:<12.3e}"
-        
-        for atom_idx in range(min(max_atoms_display, len(atom_basis_structure))):
-            if atom_idx in atom_basis_structure:
-                atom_struct = atom_basis_structure[atom_idx]
-                
-                for L in sorted(atom_struct.keys()):
-                    for m in range(-L, L+1):
-                        # Find overlap values for this specific L,m and exponent
-                        m_overlaps = []
-                        if m in atom_struct[L]:
-                            for basis_info_item in atom_struct[L][m]:
-                                if basis_info_item['exp_idx'] == exp_idx:
-                                    basis_idx = basis_info_item['basis_idx']
-                                    overlap_val = overlap_2d[exp_idx, basis_idx].item()
-                                    m_overlaps.append(overlap_val)
-                        
-                        if m_overlaps:
-                            avg_overlap = sum(m_overlaps) / len(m_overlaps)
-                            row += f"{avg_overlap:<12.3e}"
-                        else:
-                            row += f"{'---':<12}"
-            else:
-                # Fill with placeholder if atom doesn't exist
-                row += f"{'---':<12}"
-        
-        print(row)
-    
-    # L-value contribution analysis (use original unfiltered structure for complete analysis)
-    original_atom_basis_structure = mapping_info['atom_basis_structure']
-    print(f"\n{'='*80}")
-    print("L-VALUE CONTRIBUTION ANALYSIS")
-    print(f"{'='*80}")
-    print(f"{'Atom_Idx':<10}{'L':<5}{'L_Name':<8}{'N_Basis':<10}{'Total_Overlap':<15}{'Mean_Overlap':<15}")
-    print("-" * 78)
-    
-    for atom_idx in range(min(max_atoms_display, len(original_atom_basis_structure))):
-        atom_type = atom_types[atom_idx].item()
-        if atom_idx in original_atom_basis_structure:
-            atom_struct = original_atom_basis_structure[atom_idx]
-            
-            # Show all L values in analysis, but highlight which ones are displayed
-            for L in sorted(atom_struct.keys()):
-                L_name = ['s', 'p', 'd', 'f', 'g', 'h'][L] if L < 6 else f'L{L}'
-                
-                # Add indicator if this L value was shown in table
-                if L_values_to_show is not None and L not in L_values_to_show:
-                    L_name += "*"  # Mark L values not shown in table
-                
-                # Collect all basis indices for this L value
-                L_basis_indices = []
-                for m in atom_struct[L]:
-                    for basis_info_item in atom_struct[L][m]:
-                        L_basis_indices.append(basis_info_item['basis_idx'])
-                
-                if L_basis_indices:
-                    L_total_overlap = overlap_2d[:, L_basis_indices].sum().item()
-                    L_mean_overlap = overlap_2d[:, L_basis_indices].mean().item()
-                    n_basis = len(L_basis_indices)
-                    
-                    print(f"{atom_idx:<10}{L:<5}{L_name:<8}{n_basis:<10}{L_total_overlap:<15.3e}{L_mean_overlap:<15.3e}")
-    
-    if L_values_to_show is not None:
-        print("* L values marked with '*' were not shown in the table above")
+from overlap_pred.overlap_analysis import print_overlap_analysis_table
 
 def process_molecule_to_custom_data(
     molecule_idx: int,
@@ -442,46 +304,22 @@ def process_molecule_to_custom_data(
     # Convert dense overlap to CPU and double precision for storage (if present)
     dense_overlap_storage = dense_overlap.double().cpu() if dense_overlap is not None else None
 
-    # Create a serializable version of mapping_info (keep exponent_to_basis as str keys)
-    mapping_info_storage = {
-        'mapping': mapping_info.get('mapping'),
-        'exponent_to_basis': {str(k): v for k, v in mapping_info.get('exponent_to_basis', {}).items()} if mapping_info.get('exponent_to_basis') else {},
-        'basis_indices_mapping': mapping_info.get('basis_indices_mapping'),
-        'basis_info': mapping_info.get('basis_info'),
-        'exponent_values': mapping_info.get('exponent_values'),
-        'atom_basis_structure': mapping_info.get('atom_basis_structure')
-    }
+    # Create a serializable version of mapping_info using helper
+    mapping_info_storage = build_mapping_storage(mapping_info)
 
     # Compute summary statistics for logging using only the actual non-padded values
-    if dense_overlap_storage is not None and mapping_info_storage.get('basis_indices_mapping'):
-        all_vals = []
-        for exp_idx, basis_list in enumerate(mapping_info_storage['basis_indices_mapping']):
-            if basis_list:
-                vals = dense_overlap_storage[exp_idx, : len(basis_list)].flatten()
-                all_vals.append(vals)
-        if all_vals:
-            concat = torch.cat(all_vals)
-            overlap_integral_sum = float(concat.sum().item())
-            overlap_integral_mean = float(concat.mean().item())
-            overlap_integral_std = float(concat.std().item())
-            overlap_integral_max = float(concat.max().item())
-            overlap_integral_min = float(concat.min().item())
-        else:
-            overlap_integral_sum = overlap_integral_mean = overlap_integral_std = overlap_integral_max = overlap_integral_min = 0.0
-    else:
-        overlap_integral_sum = overlap_integral_mean = overlap_integral_std = overlap_integral_max = overlap_integral_min = 0.0
+    stats = compute_nonpadded_stats(dense_overlap_storage, mapping_info_storage.get('basis_indices_mapping'))
+    overlap_integral_sum = stats['sum']
+    overlap_integral_mean = stats['mean']
+    overlap_integral_std = stats['std']
+    overlap_integral_max = stats['max']
+    overlap_integral_min = stats['min']
     
     # Only print overlap summary if not in silent mode
     if not silent_basis_analysis:
         print(f"\n   2D Overlap integrals matrix summary:")
         # Report shape: prefer original sparse shape if available, otherwise report dense-per-exponent shape
-        if mapping_info_storage.get('basis_info'):
-            bi = mapping_info_storage['basis_info']
-            shape_str = (bi.get('n_exponents'), bi.get('total_basis_functions'))
-        elif dense_overlap_storage is not None:
-            shape_str = tuple(dense_overlap_storage.shape)
-        else:
-            shape_str = None
+        shape_str = safe_shape_from_mapping(mapping_info_storage, dense_overlap_storage)
         print(f"     Shape: {shape_str}")
         print(f"     Sum: {overlap_integral_sum:.6e}")
         print(f"     Mean: {overlap_integral_mean:.6e}")
@@ -492,36 +330,19 @@ def process_molecule_to_custom_data(
     if not silent_basis_analysis:
         print("\n5. Creating CustomMolecule object...")
     
-    from overlap_pred.compressed_custom_data import CompressedCustomMolecule
+    # Add dense overlap to mapping storage so helper can access it
+    mapping_info_storage['dense_overlap_matrix'] = dense_overlap_storage
 
-    # Use the dense per-exponent representation returned by compute_overlap_integrals_2d_scdp
-    dense_overlap_matrix = dense_overlap_storage
-    basis_indices_mapping = mapping_info_storage.get('basis_indices_mapping')
-
-    # Determine original sparse shape from basis_info if available
-    orig_shape = None
-    if mapping_info_storage.get('basis_info'):
-        bi = mapping_info_storage['basis_info']
-        orig_shape = (bi.get('n_exponents'), bi.get('total_basis_functions'))
-
-    # Build a CompressedCustomMolecule instance and convert to v2 CustomMolecule
-    compressed = CompressedCustomMolecule(
-        atom_types=atom_types.cpu(),
-        coords=atom_coords.cpu(),
-        id=molecule_id,
-        metadata={},
-        n_atom=int(len(atom_types)),
-        build_method=basis_type,
-        dense_overlap_matrix=dense_overlap_matrix,
-        basis_indices_mapping=basis_indices_mapping,
-        exponent_values=torch.as_tensor(mapping_info_storage['exponent_values']) if mapping_info_storage.get('exponent_values') is not None else None,
-        original_sparse_shape=orig_shape,
-        atom_basis_structure=mapping_info.get('atom_basis_structure'),
-        basis_info=mapping_info.get('basis_info')
+    # Build final CustomMolecule (v2) from compressed representation using helper
+    custom_molecule = build_custom_molecule_from_compressed(
+        atom_types=atom_types,
+        atom_coords=atom_coords,
+        molecule_id=molecule_id,
+        n_atom=len(atom_types),
+        basis_type=basis_type,
+        mapping_info_storage=mapping_info_storage,
+        mapping_info=mapping_info,
     )
-
-    # Convert compressed representation to the final CustomMolecule (v2)
-    custom_molecule = compressed.to_custom_molecule_v2()
 
     # Add additional metadata including molecule ID and dataset index and mapping
     metadata_update = {
@@ -682,9 +503,8 @@ def process_molecules_batch(
                     # Fallback to using the metadata if ID is None
                     molecule_id = custom_mol.metadata.get('molecule_id', f'idx_{mol_idx}')
                 
-                # Clean the molecule ID for use in filename (replace any problematic characters)
-                # But preserve underscores and leading zeros
-                safe_molecule_id = molecule_id.replace('/', '_').replace('\\', '_').replace(':', '_')
+                # Clean the molecule ID for use in filename (preserve underscores and leading zeros)
+                safe_molecule_id = format_safe_molecule_id(molecule_id)
                 
                 vnode_suffix = "_vnodes" if use_vnodes else ""
                 override_suffix = f"_override{override_atom_type}" if override_atom_type else ""
@@ -1068,8 +888,7 @@ def main():
     
     # Test with a small set of molecules first
     #test_molecules = [34075, 5, 343, 11797, 39941]
-    #test_molecules = np.random.choice(100000, size=20, replace=False).tolist()
-    test_molecules = [20305, 20848]
+    test_molecules = np.random.choice(100000, size=20, replace=False).tolist()
     
     # Create timestamped output directory
     timestamp = time.strftime("%Y%m%d_%H%M%S")
