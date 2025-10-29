@@ -1676,7 +1676,7 @@ def main():
                     row = i + 1
                     if not ag or len(ag['x']) == 0:
                         # add empty trace to keep subplot present
-                        fig.add_trace(go.Scattergl(x=[], y=[], mode='markers', marker=dict(size=4), name=f'L={L}'), row=row, col=1)
+                        fig.add_trace(go.Scatter(x=[], y=[], mode='markers', marker=dict(size=4), name=f'L={L}'), row=row, col=1)
                         fig.update_yaxes(title_text='Overlap value', row=row, col=1)
                         continue
                     xvals = np.asarray(ag['x'], dtype=float)
@@ -1713,7 +1713,7 @@ def main():
                     non_empty_at = any(bool(a) for a in atypes_arr.tolist())
                     if not non_empty_at:
                         hover = [f"mol_id={mid}<br>atom_index={int(idx)}<br>atom_type={atypestr}<br>alpha_norm={x:.6g}<br>overlap={yv:.6g}" for mid, atypestr, idx, x, yv in zip(mids_arr.tolist(), atypes_arr.tolist(), idxs_arr.tolist(), xvals.tolist(), yvals.tolist())]
-                        trace = go.Scattergl(x=xvals, y=yvals, mode='markers', marker=dict(size=4, opacity=0.7, color='#444444'), name=f'L={L}', hoverinfo='text', hovertext=hover)
+                        trace = go.Scatter(x=xvals, y=yvals, mode='markers', marker=dict(size=4, opacity=0.7, color='#444444'), name=f'L={L}', hoverinfo='text', hovertext=hover, customdata=mids_arr.tolist())
                         fig.add_trace(trace, row=row, col=1)
                     else:
                         # Simple qualitative color palette (cycled)
@@ -1732,7 +1732,7 @@ def main():
                             idxs_sub = idxs_arr[mask]
                             hover_sub = [f"mol_id={mid}<br>atom_index={int(idx)}<br>atom_type={at}<br>alpha_norm={x:.6g}<br>overlap={yv:.6g}" for mid, idx, x, yv in zip(mids_sub.tolist(), idxs_sub.tolist(), xs.tolist(), ys.tolist())]
                             color = palette[k % len(palette)]
-                            trace = go.Scattergl(x=xs, y=ys, mode='markers', marker=dict(size=4, opacity=0.7, color=color), name=(f'Z={at}' if at else 'Z=?'), hoverinfo='text', hovertext=hover_sub)
+                            trace = go.Scatter(x=xs, y=ys, mode='markers', marker=dict(size=4, opacity=0.7, color=color), name=(f'Z={at}' if at else 'Z=?'), hoverinfo='text', hovertext=hover_sub, customdata=mids_sub.tolist())
                             fig.add_trace(trace, row=row, col=1)
                     # set y-axis title for this row
                     fig.update_yaxes(title_text='Overlap value', row=row, col=1)
@@ -1745,9 +1745,163 @@ def main():
                 else:
                     out_html = outdir / 'interactive_overlap_per_L.html'
                 try:
-                    fig.write_html(str(out_html), include_plotlyjs='cdn')
-                    print(f"Wrote interactive Plotly HTML to {out_html}")
+                    # Produce two interactive HTMLs:
+                    # 1) a "highlight" version that uses varying per-point opacity and injects JS handlers
+                    # 2) a fast version that uses WebGL (Scattergl) and no injected JS for smoother interaction
+                    js = """
+(function(){
+    try{
+        var plots = document.getElementsByClassName('plotly-graph-div');
+        if(!plots || plots.length === 0) return;
+        var gd = plots[plots.length - 1];
+        // capture default per-trace opacity
+        var default_op = [];
+        for(var i=0;i<gd.data.length;i++){
+            var m = (gd.data[i].marker && gd.data[i].marker.opacity !== undefined) ? gd.data[i].marker.opacity : 0.7;
+            default_op.push(m);
+        }
+        gd.on('plotly_hover', function(eventData){
+            try{
+                var pts = eventData.points;
+                if(!pts || pts.length === 0) return;
+                var mol = pts[0].customdata;
+                for(var ti=0; ti<gd.data.length; ti++){
+                    var trace = gd.data[ti];
+                    var cd = trace.customdata || [];
+                    var n = Array.isArray(cd) ? cd.length : (trace.y ? trace.y.length : 0);
+                    var new_op = new Array(n);
+                    for(var j=0;j<n;j++){
+                        var val = Array.isArray(cd) ? cd[j] : null;
+                        new_op[j] = (val === mol) ? 0.95 : 0.06;
+                    }
+                    // set per-point opacity for this trace
+                    Plotly.restyle(gd, {'marker.opacity': [new_op]}, [ti]);
+                }
+            }catch(e){console.warn('hover handler error', e);} 
+        });
+        gd.on('plotly_unhover', function(){
+            try{
+                for(var ti=0; ti<gd.data.length; ti++){
+                    Plotly.restyle(gd, {'marker.opacity': default_op[ti]}, [ti]);
+                }
+            }catch(e){console.warn('unhover handler error', e);} 
+        });
+    }catch(e){console.warn('init highlight handlers failed', e);} 
+})();
+"""
+
+                    # highlight HTML (with JS handlers)
+                    out_html_highlight = out_html.parent / (out_html.stem + '_highlight' + out_html.suffix)
+                    html_h = fig.to_html(include_plotlyjs='cdn', full_html=True, post_script=js)
+                    with open(out_html_highlight, 'w') as f:
+                        f.write(html_h)
+                    print(f"Wrote interactive (highlight) Plotly HTML to {out_html_highlight}")
+
+                    # fast HTML (Scattergl, no JS) - rebuild traces as Scattergl for better performance
+                    try:
+                        fig_fast = go.Figure(layout=fig.layout)
+                        for tr in fig.data:
+                            jd = tr.to_plotly_json() if hasattr(tr, 'to_plotly_json') else dict(tr)
+                            x = jd.get('x', [])
+                            y = jd.get('y', [])
+                            mode = jd.get('mode', 'markers')
+                            marker = dict(jd.get('marker', {}) or {})
+                            # Ensure marker.opacity is a scalar for performance
+                            op = marker.get('opacity', None)
+                            if isinstance(op, (list, tuple)):
+                                marker['opacity'] = 0.7
+                            # Keep color/size if present
+                            name = jd.get('name')
+                            hovertext = jd.get('hovertext')
+                            customdata = jd.get('customdata')
+                            fig_fast.add_trace(go.Scattergl(x=x, y=y, mode=mode, marker=marker, name=name, hoverinfo='text', hovertext=hovertext, customdata=customdata))
+                        # copy layout (title, axes, etc.) already set via layout
+                        out_html_fast = out_html.parent / (out_html.stem + '_fast' + out_html.suffix)
+                        html_f = fig_fast.to_html(include_plotlyjs='cdn', full_html=True)
+                        with open(out_html_fast, 'w') as f:
+                            f.write(html_f)
+                        print(f"Wrote interactive (fast) Plotly HTML to {out_html_fast}")
+                    except Exception:
+                        # fallback: write original fig without injected JS
+                        out_html_fast = out_html.parent / (out_html.stem + '_fast' + out_html.suffix)
+                        try:
+                            html_f = fig.to_html(include_plotlyjs='cdn', full_html=True)
+                            with open(out_html_fast, 'w') as f:
+                                f.write(html_f)
+                            print(f"Wrote interactive (fast fallback) Plotly HTML to {out_html_fast}")
+                        except Exception:
+                            pass
                 except Exception:
+                    pass
+
+                # isolate HTML: like highlight but clicking a point keeps only points from that molecule (removes others until refresh)
+                js_isolate = """
+(function(){
+    try{
+        var plots = document.getElementsByClassName('plotly-graph-div');
+        if(!plots || plots.length === 0) return;
+        var gd = plots[plots.length - 1];
+        // capture default per-trace opacity
+        var default_op = [];
+        for(var i=0;i<gd.data.length;i++){
+            var m = (gd.data[i].marker && gd.data[i].marker.opacity !== undefined) ? gd.data[i].marker.opacity : 0.7;
+            default_op.push(m);
+        }
+        gd.on('plotly_hover', function(eventData){
+            try{
+                var pts = eventData.points;
+                if(!pts || pts.length === 0) return;
+                var mol = pts[0].customdata;
+                for(var ti=0; ti<gd.data.length; ti++){
+                    var trace = gd.data[ti];
+                    var cd = trace.customdata || [];
+                    var n = Array.isArray(cd) ? cd.length : (trace.y ? trace.y.length : 0);
+                    var new_op = new Array(n);
+                    for(var j=0;j<n;j++){
+                        var val = Array.isArray(cd) ? cd[j] : null;
+                        new_op[j] = (val === mol) ? 0.95 : 0.06;
+                    }
+                    Plotly.restyle(gd, {'marker.opacity': [new_op]}, [ti]);
+                }
+            }catch(e){console.warn('hover handler error', e);} 
+        });
+        // On click: keep only points with same mol id across all traces; removed points are permanently removed until page refresh
+        gd.on('plotly_click', function(eventData){
+            try{
+                var pts = eventData.points;
+                if(!pts || pts.length === 0) return;
+                var mol = pts[0].customdata;
+                for(var ti=0; ti<gd.data.length; ti++){
+                    var trace = gd.data[ti];
+                    var cd = trace.customdata || [];
+                    var xs = trace.x || [];
+                    var ys = trace.y || [];
+                    var new_x = [];
+                    var new_y = [];
+                    var new_cd = [];
+                    for(var j=0;j< (Array.isArray(cd) ? cd.length : xs.length); j++){
+                        var val = Array.isArray(cd) ? cd[j] : null;
+                        if(val === mol){
+                            new_x.push(xs[j]);
+                            new_y.push(ys[j]);
+                            new_cd.push(val);
+                        }
+                    }
+                    Plotly.restyle(gd, {'x': [new_x], 'y': [new_y], 'customdata': [new_cd]}, [ti]);
+                }
+            }catch(e){console.warn('click isolate handler error', e);} 
+        });
+    }catch(e){console.warn('init isolate handlers failed', e);} 
+})();
+"""
+                out_html_isolate = out_html.parent / (out_html.stem + '_isolate' + out_html.suffix)
+                try:
+                    html_iso = fig.to_html(include_plotlyjs='cdn', full_html=True, post_script=js_isolate)
+                    with open(out_html_isolate, 'w') as f:
+                        f.write(html_iso)
+                    print(f"Wrote interactive (isolate) Plotly HTML to {out_html_isolate}")
+                except Exception:
+                    print(f"Failed to write interactive (isolate) Plotly HTML to {out_html_isolate}")
                     pass
     except Exception:
         pass
