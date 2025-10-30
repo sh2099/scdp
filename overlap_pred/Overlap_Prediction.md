@@ -1,5 +1,8 @@
 ### Overlap Integral Prediction using GNNs
 
+#### File Structure
+
+
 #### Generating Data
 
 - Molecular data comes from the scdp data
@@ -26,10 +29,23 @@ The Generated data can be inspected using: djkljaf
 #### Data Analysis
 
 A number of scripts exist to produce plots of the data to investigate the structure and impact of normalisation. The key scripts are listed below:
-- ```analyse_overlaps.py``` this script creates plots of the unnormalised data, showing the overlap values against the exponent values, including a set of interactive plots. The code should be run as follows:
-```
-python scripts/analyse_exponent_overlap.py   --data-dir /export/data/hmichael/scdp/data/full_log_gen_new   --sample-size 20 --outdir plots/overlap_analysis --interactive-l 0  
-```
+- ```analyse_overlaps.py``` this script creates plots of the data, showing the overlap values against the exponent values, including a set of interactive plots. The code should be run as follows:
+  ```
+  python scripts/analyse_exponent_overlap.py   --data-dir /export/data/hmichael/scdp/data/full_log_gen_new   --sample-size 20 --outdir plots/overlap_analysis --interactive-l 0  
+  ```
+  The key args to be set are:
+  - ```--sample-size``` this determines how many molecules to use for the plots - the molecules are selected randomly from the full dataset, and points are plotted in a random order. - Note that when generating the interactive plots the recommended number of molecules to use is <100. Using more molecules can result in html files which take too long to render.
+  - ```--curve-norm-dir``` and ```--curve-norm-plots``` These are used to enact the normalisation procedure on the data for plotting. The path to the saved curves can be input to the first arg, and the second triggers the use of those plots to normalise the data.
+ 
+- ```apply_overlap_normalisation.py``` this script enacts the normalisation of the overlap integrals using binned regions. The mean and standard deviations are computed for each bin, and then smooth curves are fitted over each of these. There are separate curves per L value for equivariance. These curves are then used as part of the transforms for the data during training.
+  ```
+  python scripts/apply_overlap_normalisation --blah blah
+  ```
+  The key args to be set are:
+  - ```--sample-size```
+  - ```--bins```
+
+
 
 
 #### The ML model
