@@ -1,0 +1,19 @@
+# Transform configuration for overlap prediction
+# Based on the structure from boa.data.transforms
+
+_target_: scdp.model.overlap.transforms.create_overlap_transforms
+
+transforms:
+  - _target_: scdp.model.overlap.transforms.ConvertToTensor
+    
+  - _target_: scdp.model.overlap.transforms.AddRadiusGraph
+    radius: 6.0
+    max_num_neighbors: 50
+    
+  - _target_: scdp.model.overlap.transforms.AddEdgeVectorsAndDistances
+    
+  - _target_: scdp.model.overlap.transforms.AddBatchIndices
+
+# Transform parameters
+radius: 6.0
+max_num_neighbors: 50
