@@ -15,7 +15,7 @@ from torch.utils.data.distributed import DistributedSampler
 import lightning.pytorch as pl
 
 from .dataset_exponent import OverlapExponentDataset, collate_overlap_data
-from ....scdp.model.overlap.transforms import (
+from transforms import (
     MasterTransform,
     ConvertToTensor,
     EnforceFloat32,

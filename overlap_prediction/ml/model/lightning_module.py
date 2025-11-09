@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import lightning.pytorch as pl
 from torchmetrics import MeanAbsoluteError, MeanSquaredError
 
-from ....scdp.model.overlap.ovlescn import OverlapESCN, aggregate_overlap_per_molecule
+from ovlescn import OverlapESCN, aggregate_overlap_per_molecule
 
 pylogger = logging.getLogger(__name__)
 
