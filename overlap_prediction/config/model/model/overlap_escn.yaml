@@ -1,0 +1,24 @@
+_target_: scdp.model.overlap.OverlapESCN
+
+# Network architecture
+num_layers: 8
+lmax_list: [6]
+mmax_list: [2]
+cutoff: 6.0
+sphere_channels: 128
+hidden_channels: 256
+edge_channels: 128
+num_sphere_samples: 128
+
+# Distance function settings
+distance_function: "gaussian"  # "gaussian", "sigmoid", "linearsigmoid", "silu"
+basis_width_scalar: 1.0
+distance_resolution: 0.02
+
+# Overlap-specific settings
+max_L: 4  # Maximum L value for overlap predictions (output size)
+exponent_embedding_size: 128  # Size of exponent embedding
+
+# Other settings
+max_num_elements: 100
+show_timing_info: false
