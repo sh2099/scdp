@@ -490,28 +490,11 @@ def process_molecules_batch(
                     use_direct_indexing=use_direct_indexing
                 )
                 
-                # Generate output filename using molecule ID - preserve original formatting
-                # Get the molecule ID directly from the CustomMolecule object (which preserves formatting)
-                molecule_id = custom_mol.id
-                
-                # If molecule_id is still a complex object, extract it properly
-                if isinstance(molecule_id, (list, tuple)) and len(molecule_id) > 0:
-                    molecule_id = str(molecule_id[0])
-                elif molecule_id is not None:
-                    molecule_id = str(molecule_id)
-                else:
-                    # Fallback to using the metadata if ID is None
-                    molecule_id = custom_mol.metadata.get('molecule_id', f'idx_{mol_idx}')
-                
-                # Clean the molecule ID for use in filename (preserve underscores and leading zeros)
-                safe_molecule_id = format_safe_molecule_id(molecule_id)
-                
-                vnode_suffix = "_vnodes" if use_vnodes else ""
-                override_suffix = f"_override{override_atom_type}" if override_atom_type else ""
-                aug_suffix = "_aug" if use_augmentation else ""
-                custom_suffix = "_custom" if use_custom_gtos else ""
-                basis_name = "custom" if use_custom_gtos else basis_set_name
-                filename = f"molecule_{safe_molecule_id}{vnode_suffix}{override_suffix}{aug_suffix}{custom_suffix}_{basis_name}.pkl"
+                # Generate output filename using the dataset index to match final
+                # naming convention: molecule_<6-digit-zero-padded-index>.pkl
+                # This avoids a separate renaming step (see notebooks/fix_name.py)
+                seq_id = int(mol_idx)
+                filename = f"molecule_{seq_id:06d}.pkl"
                 output_file = output_path / filename
                 
                 # Save to pickle
@@ -523,9 +506,9 @@ def process_molecules_batch(
                 
                 # Log success message with chunk size info if retry was needed
                 if attempt > 1:
-                    print(f"   ✓ Saved {molecule_id} to: {output_file} (succeeded with chunk size {current_chunk_size})")
+                    print(f"   ✓ Saved to: {output_file} (succeeded with chunk size {current_chunk_size})")
                 else:
-                    print(f"   ✓ Saved {molecule_id} to: {output_file}")
+                    print(f"   ✓ Saved to: {output_file}")
                 
             except Exception as e:
                 error_str = str(e).lower()
