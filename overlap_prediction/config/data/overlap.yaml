@@ -1,0 +1,44 @@
+# Data configuration for full-scale overlap training
+
+_target_: scdp.model.overlap.OverlapDataModule
+
+# Dataset paths
+data_dir: "/export/data/hmichael/scdp/data/full_log_gen_new"
+#data_dir: "/export/data/hmichael/scdp/data/full_comp_new"
+splits_file: "/export/scratch/ialgroup/charge_density/datasplits.json"
+
+# Batch configuration
+batch_size: 16  # Per GPU batch size
+num_workers: 4
+pin_memory: true
+persistent_workers: true
+
+# Dataset parameters
+cache_size: 2000
+use_virtual_nodes: true
+subset_size: null  # Use full dataset
+
+# Transform parameters
+cutoff: 6.0
+add_edge_vectors: true
+enforce_float32: true
+
+# Normalization (fitted exponent/overlap curves)
+# Set to the directory that contains overlap_norm_meta.json and overlap_fit_curves.npz
+norm_dir: "plots/overlap_norm_3"
+replace_exponent: true  # replace exponent_value with normalized x in [0,1]
+replace_target: true   # replace overlap_target with per-L z-normalized values
+cut_outliers: true
+outlier_cutoff: 1e4  # Threshold for removing outliers in overlap targets
+
+# Data splitting (used if splits_file is not available)
+train_fraction: 0.8
+val_fraction: 0.1
+test_fraction: 0.1
+
+# Optional data filtering
+max_atoms: null
+min_atoms: null
+
+# Distributed training
+drop_last: true  # For training stability in DDP

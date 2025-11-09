@@ -1,0 +1,43 @@
+# Overlap Full Training Configuration
+
+core:
+  expname: overlap_full_training
+  project_name: scdp_overlap
+  storage_dir: /export/data/hmichael/scdp/training_runs/${core.expname}_${now:%Y%m%d_%H%M%S}
+  version: 1.0.0
+  tags: ["overlap", "full_dataset", "production"]
+
+conventions:
+  x_key: 'molecule_data'
+  y_key: 'overlap_targets'
+
+hydra:
+  job:
+    chdir: false  # Don't change working directory
+    env_set:
+      OMP_NUM_THREADS: 4
+  run:
+    dir: ${core.storage_dir}
+  sweep:
+    dir: ${core.storage_dir}
+    subdir: sweep_${hydra.job.num}
+
+  # Not saving the .hydra directory
+  output_subdir: null
+
+  defaults:
+    # Disable hydra logging configuration, otherwise the basicConfig does not have any effect
+    - override job_logging: none
+    - override hydra_logging: none
+
+defaults:
+  - data: overlap
+  - model: overlap
+  - train: overlap
+  - _self_ # as last argument to allow the override of parameters via this main config
+
+# Override for distributed training
+# Use with: python train_overlap_hydra.py hydra.launcher.n_jobs=4
+# hydra:
+#   launcher:
+#     _target_: hydra._internal.BasicLauncher

@@ -1,0 +1,40 @@
+# Model configuration for full-scale overlap training
+
+_target_: scdp.model.overlap.OverlapLightningModule
+
+# Model architecture parameters
+cutoff: 6.0
+mask_overlap_cutoff: 12.0
+max_num_elements: 100
+num_layers: 6
+lmax_list: [4]
+mmax_list: [2]
+sphere_channels: 128
+hidden_channels: 256
+edge_channels: 128
+num_sphere_samples: 128
+
+# Distance and exponent embedding
+distance_function: "gaussian"
+basis_width_scalar: 1.0
+distance_resolution: 0.02
+exponent_function: "gaussian"
+exponent_min: 0.0001
+exponent_max: 100000.0
+
+# Loss configuration
+criterion: "mse"
+loss_aggregation: "mean"
+
+# Optimization parameters
+learning_rate: 5e-3
+weight_decay: 1e-6
+gradient_clip_val: 1.0
+
+# Adam optimizer parameters
+adam_beta1: 0.9
+adam_beta2: 0.999
+
+# Model behavior
+show_timing_info: false
+compile_model: false  # Set to true for potential speedup with PyTorch 2.0+

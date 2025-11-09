@@ -1,0 +1,83 @@
+# Training configuration for full-scale overlap train  
+
+trainer:
+  max_epochs: 8
+  accelerator: "gpu"
+  devices: 1  # Will be overridden by command line for multi-GPU
+  strategy: "auto"  # Will use DDP automatically for multi-GPU
+  precision: "32-true"
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
+  accumulate_grad_batches: 1
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 50
+  enable_progress_bar: true
+  enable_model_summary: true
+  deterministic: false  # Set to true for reproducibility (slower)
+  benchmark: true  # Optimize for consistent input sizes
+  fast_dev_run: false  # For debug mode
+  limit_train_batches: null
+  limit_val_batches: null
+  limit_test_batches: null
+
+# Optimization
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: ${model.learning_rate}
+  weight_decay: ${model.weight_decay}
+  amsgrad: true
+  eps: 1e-8
+
+# Learning rate scheduling
+scheduler:
+  _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+  mode: "min"
+  factor: 0.8
+  patience: 10
+  threshold: 1e-6
+  min_lr: 1e-7
+
+# Callbacks
+callbacks:
+  # Early stopping - will use train_loss if val_loss not available
+  - _target_: lightning.pytorch.callbacks.EarlyStopping
+    monitor: "val_loss"
+    patience: 25
+    mode: "min"
+    min_delta: 1e-6
+    verbose: true
+    check_finite: true
+    strict: false  # Don't fail if metric is missing
+
+  # Model checkpointing
+  - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    monitor: "val_loss"
+    mode: "min"
+    save_top_k: 5
+    save_last: true
+    filename: "epoch_{epoch:03d}_val_loss_{val_loss:.6f}"
+    auto_insert_metric_name: false
+    every_n_epochs: 1 
+
+  # Learning rate monitoring
+  - _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: "epoch"
+
+  # Model summary
+  - _target_: lightning.pytorch.callbacks.RichModelSummary
+    max_depth: 2
+
+# Logging configuration
+logging:
+  # TensorBoard
+  tensorboard:
+    _target_: lightning.pytorch.loggers.TensorBoardLogger
+    save_dir: "${core.storage_dir}/tb_logs"
+    name: "${core.expname}"
+
+# Training behavior
+seed: 42
+deterministic: false  # Set to true for full reproducibility
+
+# Profiling (for debugging)
+profiler: null  # Set to "simple" or "advanced" for profiling
