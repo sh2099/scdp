@@ -1681,6 +1681,24 @@ def main():
                         continue
                     xvals = np.asarray(ag['x'], dtype=float)
                     yvals = np.asarray(ag['y'], dtype=float)
+                    # By default plot raw overlap values. If curve-normalization is requested
+                    # and we have curve_payload, transform y -> z = (O - mu_L(x))/sigma_L(x)
+                    y_plot = yvals
+                    try:
+                        if args.curve_norm_plots and curve_payload is not None:
+                            x_grid = curve_payload.get('x_grid')
+                            mean_grid = curve_payload.get('mean_grid')
+                            std_grid = curve_payload.get('std_grid')
+                            if x_grid is not None and mean_grid is not None and std_grid is not None:
+                                mu_arr, sd_arr = _interp_mu_sigma_for_L(xvals, x_grid, mean_grid, std_grid, L)
+                                with np.errstate(divide='ignore', invalid='ignore'):
+                                    zvals = (yvals - mu_arr) / sd_arr
+                                # Replace non-finite with nan to avoid plotting garbage
+                                zvals[~np.isfinite(zvals)] = np.nan
+                                y_plot = zvals
+                    except Exception:
+                        # Fallback to raw values on any error
+                        y_plot = yvals
                     mids = ag.get('mol_id', [])
                     atypes = ag.get('atom_types', [])
                     idxs = ag.get('idx', [])
@@ -1712,8 +1730,12 @@ def main():
                     # Fallback: if all atom-type entries empty, create a single unlabeled trace (but include atom index)
                     non_empty_at = any(bool(a) for a in atypes_arr.tolist())
                     if not non_empty_at:
+                        # hover shows raw overlap (yv) while plotted y is curve-normalized when enabled
                         hover = [f"mol_id={mid}<br>atom_index={int(idx)}<br>atom_type={atypestr}<br>alpha_norm={x:.6g}<br>overlap={yv:.6g}" for mid, atypestr, idx, x, yv in zip(mids_arr.tolist(), atypes_arr.tolist(), idxs_arr.tolist(), xvals.tolist(), yvals.tolist())]
-                        trace = go.Scatter(x=xvals, y=yvals, mode='markers', marker=dict(size=4, opacity=0.7, color='#444444'), name=f'L={L}', hoverinfo='text', hovertext=hover, customdata=mids_arr.tolist())
+                        # customdata holds [mol_id, atom_index] per point to allow click-to-isolate by atom
+                        # encode customdata as a stable string "mol_id|||idx" to survive JSON roundtrips
+                        custom_cd = [f"{mid}|||{int(idx)}" for mid, idx in zip(mids_arr.tolist(), idxs_arr.tolist())]
+                        trace = go.Scatter(x=xvals, y=y_plot, mode='markers', marker=dict(size=4, opacity=0.7, color='#444444'), name=f'L={L}', hoverinfo='text', hovertext=hover, customdata=custom_cd)
                         fig.add_trace(trace, row=row, col=1)
                     else:
                         # Simple qualitative color palette (cycled)
@@ -1727,15 +1749,21 @@ def main():
                             if not np.any(mask):
                                 continue
                             xs = xvals[mask]
-                            ys = yvals[mask]
+                            ys_raw = yvals[mask]
+                            ys_plot = y_plot[mask]
                             mids_sub = mids_arr[mask]
                             idxs_sub = idxs_arr[mask]
-                            hover_sub = [f"mol_id={mid}<br>atom_index={int(idx)}<br>atom_type={at}<br>alpha_norm={x:.6g}<br>overlap={yv:.6g}" for mid, idx, x, yv in zip(mids_sub.tolist(), idxs_sub.tolist(), xs.tolist(), ys.tolist())]
+                            # hover shows the raw overlap value, while plotted y is the (possibly) curve-normalized z
+                            hover_sub = [f"mol_id={mid}<br>atom_index={int(idx)}<br>atom_type={at}<br>alpha_norm={x:.6g}<br>overlap={yv:.6g}" for mid, idx, x, yv in zip(mids_sub.tolist(), idxs_sub.tolist(), xs.tolist(), ys_raw.tolist())]
                             color = palette[k % len(palette)]
-                            trace = go.Scatter(x=xs, y=ys, mode='markers', marker=dict(size=4, opacity=0.7, color=color), name=(f'Z={at}' if at else 'Z=?'), hoverinfo='text', hovertext=hover_sub, customdata=mids_sub.tolist())
+                            custom_cd_sub = [f"{mid}|||{int(idx)}" for mid, idx in zip(mids_sub.tolist(), idxs_sub.tolist())]
+                            trace = go.Scatter(x=xs, y=ys_plot, mode='markers', marker=dict(size=4, opacity=0.7, color=color), name=(f'Z={at}' if at else 'Z=?'), hoverinfo='text', hovertext=hover_sub, customdata=custom_cd_sub)
                             fig.add_trace(trace, row=row, col=1)
                     # set y-axis title for this row
-                    fig.update_yaxes(title_text='Overlap value', row=row, col=1)
+                    if args.curve_norm_plots and curve_payload is not None:
+                        fig.update_yaxes(title_text='Curve-normalized z', row=row, col=1)
+                    else:
+                        fig.update_yaxes(title_text='Overlap value', row=row, col=1)
                 # X axis label on bottom subplot
                 fig.update_xaxes(title_text='Normalized exponent α_new', row=nrows, col=1)
                 fig.update_layout(title='Overlap vs normalized exponent by L (interactive)', showlegend=True, template='plotly_white', width=1000, height=1000*nrows)
@@ -1764,7 +1792,16 @@ def main():
             try{
                 var pts = eventData.points;
                 if(!pts || pts.length === 0) return;
-                var mol = pts[0].customdata;
+                var cd0 = pts[0].customdata;
+                var mol = null;
+                if(Array.isArray(cd0)){
+                    mol = cd0[0];
+                } else if(typeof cd0 === 'string' && cd0.indexOf('|||')>=0){
+                    mol = cd0.split('|||')[0];
+                } else {
+                    mol = cd0;
+                }
+                var mol_str = (mol === null || mol === undefined) ? '' : String(mol);
                 for(var ti=0; ti<gd.data.length; ti++){
                     var trace = gd.data[ti];
                     var cd = trace.customdata || [];
@@ -1772,7 +1809,16 @@ def main():
                     var new_op = new Array(n);
                     for(var j=0;j<n;j++){
                         var val = Array.isArray(cd) ? cd[j] : null;
-                        new_op[j] = (val === mol) ? 0.95 : 0.06;
+                        var val_mol = null;
+                        if(Array.isArray(val)){
+                            val_mol = val[0];
+                        } else if(typeof val === 'string' && val.indexOf('|||')>=0){
+                            val_mol = val.split('|||')[0];
+                        } else {
+                            val_mol = val;
+                        }
+                        var val_mol_str = (val_mol === null || val_mol === undefined) ? '' : String(val_mol);
+                        new_op[j] = (val_mol_str === mol_str) ? 0.95 : 0.06;
                     }
                     // set per-point opacity for this trace
                     Plotly.restyle(gd, {'marker.opacity': [new_op]}, [ti]);
@@ -1865,29 +1911,97 @@ def main():
                 }
             }catch(e){console.warn('hover handler error', e);} 
         });
-        // On click: keep only points with same mol id across all traces; removed points are permanently removed until page refresh
+        // On click: first click isolates by molecule, second click (on same molecule) further isolates to atom index
         gd.on('plotly_click', function(eventData){
             try{
                 var pts = eventData.points;
                 if(!pts || pts.length === 0) return;
-                var mol = pts[0].customdata;
-                for(var ti=0; ti<gd.data.length; ti++){
-                    var trace = gd.data[ti];
-                    var cd = trace.customdata || [];
-                    var xs = trace.x || [];
-                    var ys = trace.y || [];
-                    var new_x = [];
-                    var new_y = [];
-                    var new_cd = [];
-                    for(var j=0;j< (Array.isArray(cd) ? cd.length : xs.length); j++){
-                        var val = Array.isArray(cd) ? cd[j] : null;
-                        if(val === mol){
-                            new_x.push(xs[j]);
-                            new_y.push(ys[j]);
-                            new_cd.push(val);
+                var cd0 = pts[0].customdata;
+                var clicked_mol = null;
+                var clicked_idx = null;
+                if(Array.isArray(cd0)){
+                    clicked_mol = cd0[0];
+                    clicked_idx = (cd0.length>1) ? parseInt(cd0[1]) : null;
+                } else if(typeof cd0 === 'string' && cd0.indexOf('|||')>=0){
+                    var parts = cd0.split('|||');
+                    clicked_mol = parts[0];
+                    clicked_idx = (parts.length>1) ? parseInt(parts[1]) : null;
+                } else {
+                    clicked_mol = cd0;
+                }
+                clicked_mol = (clicked_mol === null || clicked_mol === undefined) ? '' : String(clicked_mol);
+                if(!window.__isolate_state) window.__isolate_state = {mol:null, atom:null};
+                var state = window.__isolate_state;
+                // If first click on a different molecule, set molecule and clear atom filter
+                if(state.mol === null || state.mol !== clicked_mol){
+                    state.mol = clicked_mol;
+                    state.atom = null;
+                    for(var ti=0; ti<gd.data.length; ti++){
+                        var trace = gd.data[ti];
+                        var cd = trace.customdata || [];
+                        var xs = trace.x || [];
+                        var ys = trace.y || [];
+                        var new_x = [];
+                        var new_y = [];
+                        var new_cd = [];
+                        var n = Array.isArray(cd) ? cd.length : xs.length;
+                        for(var j=0;j<n; j++){
+                            var val = Array.isArray(cd) ? cd[j] : null;
+                            var val_mol = null;
+                            var val_idx_raw = null;
+                            if(Array.isArray(val)){
+                                val_mol = val[0];
+                                val_idx_raw = (val.length>1) ? val[1] : null;
+                            } else if(typeof val === 'string' && val.indexOf('|||')>=0){
+                                var parts = val.split('|||');
+                                val_mol = parts[0];
+                                val_idx_raw = (parts.length>1) ? parts[1] : null;
+                            } else {
+                                val_mol = val;
+                            }
+                            var val_mol_str = (val_mol === null || val_mol === undefined) ? '' : String(val_mol);
+                            if(val_mol_str === clicked_mol){
+                                new_x.push(xs[j]); new_y.push(ys[j]); new_cd.push(val);
+                            }
+                        }
+                        Plotly.restyle(gd, {'x': [new_x], 'y': [new_y], 'customdata': [new_cd]}, [ti]);
+                    }
+                } else {
+                    // Second click on same molecule: if an atom index is present, filter to that atom
+                    if(clicked_idx !== null && state.atom !== clicked_idx){
+                        state.atom = clicked_idx;
+                        for(var ti=0; ti<gd.data.length; ti++){
+                            var trace = gd.data[ti];
+                            var cd = trace.customdata || [];
+                            var xs = trace.x || [];
+                            var ys = trace.y || [];
+                            var new_x = [];
+                            var new_y = [];
+                            var new_cd = [];
+                            var n = Array.isArray(cd) ? cd.length : xs.length;
+                            for(var j=0;j<n; j++){
+                                var val = Array.isArray(cd) ? cd[j] : null;
+                                var val_mol = null;
+                                var val_idx_raw = null;
+                                if(Array.isArray(val)){
+                                    val_mol = val[0];
+                                    val_idx_raw = (val.length>1) ? val[1] : null;
+                                } else if(typeof val === 'string' && val.indexOf('|||')>=0){
+                                    var parts = val.split('|||');
+                                    val_mol = parts[0];
+                                    val_idx_raw = (parts.length>1) ? parts[1] : null;
+                                } else {
+                                    val_mol = val;
+                                }
+                                var val_mol_str = (val_mol === null || val_mol === undefined) ? '' : String(val_mol);
+                                var val_idx = (val_idx_raw === null || val_idx_raw === undefined) ? null : parseInt(val_idx_raw);
+                                if(val_mol_str === clicked_mol && val_idx === clicked_idx){
+                                    new_x.push(xs[j]); new_y.push(ys[j]); new_cd.push(val);
+                                }
+                            }
+                            Plotly.restyle(gd, {'x': [new_x], 'y': [new_y], 'customdata': [new_cd]}, [ti]);
                         }
                     }
-                    Plotly.restyle(gd, {'x': [new_x], 'y': [new_y], 'customdata': [new_cd]}, [ti]);
                 }
             }catch(e){console.warn('click isolate handler error', e);} 
         });
