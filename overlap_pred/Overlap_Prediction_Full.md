@@ -196,3 +196,82 @@ If you want, I can also:
 
 ---
 File created to capture the full process for overlap integral prediction and training using the scdp codebase.
+
+## Required files for the pipeline
+
+Below is a concise list of the primary files, modules and configs used by the end-to-end pipeline. Add or adapt paths as needed for your local setup.
+
+- `overlap_pred/gen_ovlp_data.py` — Dataset generator: constructs graphs, GTOs (with exponents/L), and computes/stores overlap examples.
+- `scripts/analyse_exponent_overlap.py` — Data analysis and plotting utilities to inspect overlaps vs exponents and produce interactive plots.
+- `scripts/apply_overlap_normalisation.py` — Normalisation pipeline that computes binned means/stds per exponent (and per-L), fits smooth curves, and saves transforms.
+- `train_overlap_hydra.py` — Hydra + PyTorch Lightning training entrypoint. Instantiates `OverlapDataModule` and `OverlapLightningModule`, sets up Trainer, callbacks, logging and checkpointing.
+- `scdp/model/overlap.py` — Core datamodule and Lightning module (provides `OverlapDataModule` and `OverlapLightningModule`).
+- `scdp/common/system.py` — Project utilities (constants such as `PROJECT_ROOT`, logging helpers, and hyperparameter logging helpers used by the training script).
+- `scdp/config/overlap_full.*` — Hydra configuration for training (the script loads the `overlap_full` config from `scdp/config`). Ensure the config file(s) used by Hydra are present and adapted to your environment.
+- `requirements.txt` / `setup.py` (or `environment.yml`) — Python dependencies and environment specification used to create the runtime environment.
+
+Optional / helpful files:
+
+- `overlap_pred/overlap_analysis.py`, `overlap_pred/gen_helpers.py` — helper scripts used in data generation / inspection (if present in the `overlap_pred` folder).
+- `plots/` — example outputs from analysis scripts (useful for debugging and visual verification).
+- Any storage or mount-specific scripts or README notes that point to the scdp raw data location (e.g., institutional scratch mount instructions).
+
+If you'd like, I can scan the repo to produce an exhaustive manifest (including relative paths for every helper file referenced by the generator and datamodule) and add it to this document.
+
+## Required files and dependencies (expanded)
+
+Below is a more exhaustive list of project modules and external packages that the main pipeline entrypoints import or rely on. This list is helpful for environment creation, code review, and quick dependency checks.
+
+Project (internal) modules and scripts
+- Data generation and helpers (overlap_pred/):
+  - `overlap_pred/gen_ovlp_data.py` (generator entrypoint)
+  - `overlap_pred/load_mol.py` (dataset loaders and utilities)
+  - `overlap_pred/comp_overlap.py` (overlap integral computation)
+  - `overlap_pred/custom_gto_basis.py` (GTO construction utilities)
+  - `overlap_pred/custom_data.py`, `overlap_pred/custom_data_2.py`, `overlap_pred/compressed_custom_data.py` (CustomMolecule classes and serialization)
+  - `overlap_pred/gen_helpers.py` (helper functions used by generator)
+  - `overlap_pred/overlap_analysis.py` (analysis helpers used by generator)
+
+- Analysis & normalization scripts (scripts/):
+  - `scripts/analyse_exponent_overlap.py` (visual analysis, interactive plots)
+  - `scripts/apply_overlap_normalization.py` (apply fitted normalization curves)
+  - `scripts/fit_overlap_normalization.py` (fitting binned μ/σ curves) — if present
+  - `scripts/plot_molecule_geometry.py`, `scripts/example_overlap.py` (supporting scripts often used during debugging)
+
+- Model & training (scdp/):
+  - `train_overlap_hydra.py` (Hydra entrypoint for training)
+  - `scdp/common/system.py` (project utilities and env handling)
+  - `scdp/model/overlap/__init__.py` and submodules:
+    - `scdp/model/overlap/data_module.py` (OverlapDataModule)
+    - `scdp/model/overlap/lightning_module.py` (OverlapLightningModule)
+    - `scdp/model/overlap/dataset_exponent.py`, `data_utils.py`, `transforms.py` (dataset utilities and transforms)
+    - `scdp/model/overlap/module.py`, `ovlescn.py`, `memory_utils.py`, `memory_callbacks.py`, `transform_config.yaml`, `README.md` (model components and docs)
+  - Other model utilities used across the project: `scdp/model/gtos.py`, `scdp/model/basis_set.py`, `scdp/model/utils.py`, `scdp/model/module.py` and SCN-related modules under `scdp/model/scn/`.
+
+- Hydra configuration files (scdp/config/):
+  - `scdp/config/overlap_full.yaml`, `scdp/config/overlap_default.yaml`, `scdp/config/default.yaml`
+  - Model and training configs used by the pipeline (examples):
+    - `scdp/config/model/overlap.yaml`, `scdp/config/model/overlap_full.yaml`, `scdp/config/model/model/overlap_escn.yaml`
+    - `scdp/config/data/overlap.yaml`, `scdp/config/data/overlap_full.yaml`
+    - `scdp/config/train/overlap_full.yaml`, `scdp/config/train/overlap.yaml`, `scdp/config/train/default.yaml`
+
+Essential external Python packages (required at runtime)
+- PyTorch (torch)
+- PyTorch Lightning (lightning.pytorch / pytorch_lightning)
+- Hydra (hydra-core)
+- OmegaConf (omegaconf)
+- NumPy (numpy)
+- SciPy (scipy) — used for interpolation (PchipInterpolator)
+- Matplotlib (matplotlib)
+- tqdm (optional, used in scripts for progress bars)
+
+Optional / recommended packages for enhanced functionality
+- plotly (interactive visualizations in `scripts/analyse_exponent_overlap.py`)
+- torch_geometric (PyG) for radius_graph and neighbor computations (optional; fallbacks exist)
+- pandas (sometimes useful for CSV handling though not mandatory)
+- scikit-learn / more advanced stats packages if you extend normalisation or fitting approaches
+
+Notes
+- Several scripts check for the optional availability of packages (Plotly, torch_geometric, tqdm) and degrade gracefully when they are absent — see `scripts/analyse_exponent_overlap.py`.
+- If you need an exact environment, I can produce a pinned `environment.yml` or `requirements.txt` subset containing these packages and suggested versions used in the project.
+
